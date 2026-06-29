@@ -189,12 +189,28 @@
     const total = (costs.court||0) + (costs.water||0) + (costs.shuttle||0) + (costs.other||0);
     const mKey = sessionMonthKey(s);
     const yesNames = Object.entries(s.votes).filter(([,v]) => v === 'yes').map(([name]) => name);
-    const fixedNames = yesNames.filter(n => memberType(n, mKey) === 'fixed');
-    const casualNames = yesNames.filter(n => memberType(n, mKey) !== 'fixed');
+    let fixedNames = yesNames.filter(n => memberType(n, mKey) === 'fixed');
+    let casualNames = yesNames.filter(n => memberType(n, mKey) !== 'fixed');
+
+    // Pass slot: vãng lai nhận pass từ cố định sẽ tính phí như cố định
+    const passes = s.passes || {};
+    const passedToNames = []; // tên vãng lai nhận pass (đang trong casualNames và có người pass cho)
+    Object.values(passes).forEach(casualMemberId => {
+      if (!casualMemberId) return;
+      const casualMember = state.members.find(x => x.id === casualMemberId);
+      if (casualMember && casualNames.includes(casualMember.name) && !passedToNames.includes(casualMember.name)) {
+        passedToNames.push(casualMember.name);
+      }
+    });
+    if (passedToNames.length) {
+      casualNames = casualNames.filter(n => !passedToNames.includes(n));
+      fixedNames = fixedNames.concat(passedToNames);
+    }
+
     const m = state.settings.casualMultiplier || 1.5;
     const denom = fixedNames.length + m * casualNames.length;
     const unit = denom > 0 ? total / denom : 0;
-    return { total, fixedNames, casualNames, fixedShare: unit, casualShare: unit * m, multiplier: m };
+    return { total, fixedNames, casualNames, fixedShare: unit, casualShare: unit * m, multiplier: m, passedToNames };
   }
 
   // ---------- RENDER ROOT ----------
@@ -996,21 +1012,33 @@
           <div style="font-size:13px; color:#6b7a73; margin-top:2px;">${court ? escapeHtml(court.name) : 'Chưa chọn sân'}${court && court.address ? ' · ' + escapeHtml(court.address) : ''}${court && court.mapLink ? ` · <a href="${escapeHtml(court.mapLink)}" target="_blank" style="color:#0C447C;">📍 Google Maps</a>` : ''}</div>
           ${s.note ? `<div style="font-size:13px; color:#8a877d; margin-top:2px;">${escapeHtml(s.note)}</div>` : ''}
         </div>
-        ${canDelete() ? `<button class="bc-btn danger small" id="del-${s.id}">Xoá</button>` : ''}
+        <div style="display:flex; gap:6px; align-items:center;">
+          ${canManage() ? `<button class="bc-btn ${s.locked?'danger':'outline'} small" id="lock-${s.id}">${s.locked ? 'Mở chốt' : 'Chốt buổi'}</button>` : ''}
+          ${canDelete() ? `<button class="bc-btn danger small" id="del-${s.id}">Xoá</button>` : ''}
+        </div>
       </div>
-      <div style="display:flex; gap:14px; margin-top:10px; font-size:13px; color:#6b7a73;">
+      <div style="display:flex; gap:14px; margin-top:10px; font-size:13px; color:#6b7a73; flex-wrap:wrap;">
         <span><span class="bc-badge" style="background:#EAF3DE; color:#27500A;">${yes.length}${s.max ? '/'+s.max : ''} tham gia</span></span>
         <span><span class="bc-badge" style="background:#FAECE7; color:#993C1D;">${no.length} vắng</span></span>
         ${full ? `<span class="bc-badge" style="background:#FAEEDA; color:#854F0B;">Đủ người</span>` : ''}
+        ${s.locked ? `<span class="bc-badge" style="background:#FAEEDA; color:#854F0B;">🔒 Đã chốt</span>` : ''}
       </div>
       <div style="margin-top:10px; display:flex; gap:8px;" id="vote-${s.id}"></div>
       <div style="margin-top:12px; border-top:1px dashed #E3E0D6; padding-top:10px;" id="vote-table-${s.id}"></div>
       <div style="margin-top:12px; border-top:1px dashed #E3E0D6; padding-top:10px;" id="cost-${s.id}"></div>
     </div>`);
 
+    if (canManage()) {
+      const lockBtn = card.querySelector(`#lock-${s.id}`);
+      lockBtn.onclick = () => { s.locked = !s.locked; saveSessions(); render(); };
+    }
+
     const voteRow = card.querySelector(`#vote-${s.id}`);
+    const lockedForMe = s.locked && role() === 'r2';
     if (state.me.status !== 'active') {
       voteRow.appendChild(el(`<div style="font-size:13px; color:#8a877d;">Tài khoản của bạn đang Ngưng hoạt động, liên hệ Admin để vote lại.</div>`));
+    } else if (lockedForMe) {
+      voteRow.appendChild(el(`<div style="font-size:13px; color:#854F0B;">🔒 Buổi đã được chốt, không thể thay đổi vote. Liên hệ Admin/R1 nếu cần sửa.</div>`));
     } else {
       const myVote = s.votes[state.me.name];
       const yesBtn = el(`<button class="bc-btn small ${myVote==='yes'?'':'outline'}">Tham gia</button>`);
@@ -1026,6 +1054,11 @@
       voteTable.appendChild(el(`<div style="font-size:13px; color:#8a877d;">Chưa có thành viên nào.</div>`));
     } else {
       const mKey = sessionMonthKey(s);
+      s.passes = s.passes || {};
+      const passes = s.passes;
+      const casualAttendees = state.members.filter(x => s.votes[x.name] === 'yes' && memberType(x.name, mKey) !== 'fixed');
+      const lockedForOthers = s.locked && role() === 'r2';
+
       const tbl = el(`<table style="width:100%; font-size:13px; border-collapse:collapse;"></table>`);
       state.members.forEach(m => {
         const v = s.votes[m.name];
@@ -1035,14 +1068,49 @@
           : v === 'no'
             ? `<span class="bc-badge" style="background:#FAECE7; color:#993C1D;">Vắng</span>`
             : `<span class="bc-badge" style="background:#F1EFE8; color:#888780;">Chưa vote</span>`;
+
+        let passCell = '';
+        if (t === 'fixed') {
+          const isSelfRow = state.me && state.me.id === m.id;
+          const editable = canManage() || (isSelfRow && !lockedForOthers);
+          if (editable) {
+            passCell = `<select class="bc-select" id="pass-${s.id}-${m.id}" style="width:150px; padding:4px 6px; font-size:12px;">
+              <option value="">Không pass</option>
+              ${casualAttendees.map(c => `<option value="${c.id}" ${passes[m.id]===c.id?'selected':''}>Pass cho ${escapeHtml(c.name)}</option>`).join('')}
+            </select>`;
+          } else if (passes[m.id]) {
+            const target = state.members.find(x => x.id === passes[m.id]);
+            passCell = target ? `<span style="font-size:12px; color:#8a877d;">Đã pass cho ${escapeHtml(target.name)}</span>` : '';
+          }
+        } else {
+          const fromId = Object.keys(passes).find(fid => passes[fid] === m.id);
+          if (fromId) {
+            const fromMember = state.members.find(x => x.id === fromId);
+            passCell = `<span class="bc-badge" style="background:#E6F1FB; color:#0C447C;">Nhận pass từ ${fromMember ? escapeHtml(fromMember.name) : '?'}</span>`;
+          }
+        }
+
         tbl.appendChild(el(`<tr style="border-top:1px solid #F1EFE8;">
           <td style="padding:5px 4px; width:30px;">${avatarHtml(m, 26)}</td>
           <td style="padding:5px 4px;">${escapeHtml(m.name)}</td>
           <td style="padding:5px 4px; color:#8a877d;">${t === 'fixed' ? 'Cố định' : 'Vãng lai'}</td>
+          <td style="padding:5px 4px;">${passCell}</td>
           <td style="padding:5px 4px; text-align:right;">${statusBadge}</td>
         </tr>`));
       });
       voteTable.appendChild(tbl);
+
+      setTimeout(() => {
+        state.members.forEach(m => {
+          const sel = document.getElementById(`pass-${s.id}-${m.id}`);
+          if (sel) sel.onchange = (e) => {
+            const val = e.target.value;
+            s.passes = s.passes || {};
+            if (val) s.passes[m.id] = val; else delete s.passes[m.id];
+            saveSessions(); render();
+          };
+        });
+      }, 0);
     }
 
     const costBox = card.querySelector(`#cost-${s.id}`);
@@ -1067,7 +1135,7 @@
       if (shares.fixedNames.length || shares.casualNames.length) {
         const detail = el(`<table style="width:100%; font-size:13px; border-collapse:collapse; margin-top:8px;"></table>`);
         shares.fixedNames.forEach(name => detail.appendChild(el(`<tr style="border-top:1px solid #F1EFE8;">
-          <td style="padding:5px 4px;">${escapeHtml(name)}</td><td style="padding:5px 4px; color:#8a877d;">Cố định</td>
+          <td style="padding:5px 4px;">${escapeHtml(name)}</td><td style="padding:5px 4px; color:#8a877d;">${shares.passedToNames.includes(name) ? 'Vãng lai (nhận pass)' : 'Cố định'}</td>
           <td style="padding:5px 4px; text-align:right; font-weight:500;">${formatVND(shares.fixedShare)}</td></tr>`)));
         shares.casualNames.forEach(name => detail.appendChild(el(`<tr style="border-top:1px solid #F1EFE8;">
           <td style="padding:5px 4px;">${escapeHtml(name)}</td><td style="padding:5px 4px; color:#8a877d;">Vãng lai</td>
