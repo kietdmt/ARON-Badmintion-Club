@@ -373,11 +373,17 @@
       </div>
       <div style="display:flex; align-items:center; gap:8px;">
         <span class="bc-badge" style="background:${bg}; color:${fg};">${escapeHtml(state.me.name)} · ${ROLE_LABEL[state.me.role]}</span>
+        <button class="bc-btn outline small" id="bc-refresh" title="Tải lại dữ liệu mới nhất">⟳ Làm mới</button>
         <button class="bc-btn outline small" id="bc-logout">Đăng xuất</button>
       </div>
     </div>`);
     setTimeout(() => {
       document.getElementById('bc-logout').onclick = () => { state.myUsername = null; state.me = null; saveMyUsername(); render(); };
+      const refreshBtn = document.getElementById('bc-refresh');
+      refreshBtn.onclick = async () => {
+        refreshBtn.textContent = 'Đang tải...';
+        await refreshAll();
+      };
     }, 0);
     return wrap;
   }
@@ -386,7 +392,7 @@
     const wrap = el(`<div style="display:flex; gap:6px; margin-bottom:1rem; border-bottom:1px solid #E3E0D6; padding-bottom:0.75rem;"></div>`);
     [['sessions','Lịch đánh'],['members','Thành viên'],['courts','Sân cầu'],['fund','Quỹ & chi phí']].forEach(([key,label]) => {
       const t = el(`<div class="bc-tab ${state.tab===key?'active':''}">${label}</div>`);
-      t.onclick = () => { state.tab = key; render(); };
+      t.onclick = () => { state.tab = key; render(); refreshAll(); };
       wrap.appendChild(t);
     });
     return wrap;
@@ -1359,10 +1365,52 @@
     return card;
   }
 
+  // ---------- LÀM MỚI DỮ LIỆU (tránh hiển thị vote/dữ liệu cũ khi nhiều người cùng dùng) ----------
+  let refreshing = false;
+  async function refreshAll(){
+    if (!state.me || refreshing) return;
+    // Không làm mới khi người dùng đang gõ trong một ô input/textarea/select, để tránh mất dữ liệu đang nhập
+    const ae = document.activeElement;
+    if (ae && /INPUT|TEXTAREA|SELECT/.test(ae.tagName)) return;
+    refreshing = true;
+    try {
+      const [members, courts, sessions, settingsRaw, payments, fund, donations] = await Promise.all([
+        loadKey('bc_members', state.members),
+        loadKey('bc_courts', state.courts),
+        loadKey('bc_sessions', state.sessions),
+        loadKey('bc_settings', {}),
+        loadKey('bc_payments', state.payments),
+        loadKey('bc_fund', state.fund),
+        loadKey('bc_donations', state.donations),
+      ]);
+      state.members = members;
+      state.courts = courts;
+      state.sessions = sessions;
+      state.settings = Object.assign({ casualMultiplier: 1.5, logoUrl: '', bannerUrl: '' }, settingsRaw);
+      state.payments = payments;
+      state.fund = fund;
+      state.donations = donations;
+      resolveMe();
+      render();
+    } catch(e) {
+      console.error('Làm mới thất bại', e);
+    } finally {
+      refreshing = false;
+    }
+  }
+  let autoRefreshTimer = null;
+  function startAutoRefresh(){
+    if (autoRefreshTimer) return;
+    autoRefreshTimer = setInterval(refreshAll, 7000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshAll(); });
+    window.addEventListener('focus', () => refreshAll());
+  }
+
   loadAll().then(() => {
     document.getElementById('loading').style.display = 'none';
     document.getElementById('root').style.display = 'block';
     render();
+    startAutoRefresh();
   });
 })();
 </script>
