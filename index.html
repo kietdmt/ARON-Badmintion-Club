@@ -43,7 +43,12 @@
   function normEmail(e){ return (e||'').trim().toLowerCase(); }
   function normUsername(u){ return (u||'').trim().toLowerCase().replace(/\s+/g,''); }
   function el(html){ const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content.firstChild; }
-  function formatVND(n){ n = Math.round(n || 0); return n.toLocaleString('vi-VN') + 'đ'; }
+  function formatVND(n, signed){
+    n = Math.round(n || 0);
+    const abs = Math.abs(n).toLocaleString('vi-VN');
+    if (signed) return (n >= 0 ? '+' : '-') + abs + 'đ';
+    return abs + 'đ';
+  }
   function formatDate(d){ if (!d) return ''; const p = d.split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0]}` : d; }
   const WEEKDAYS = ["Chủ nhật","Thứ 2","Thứ 3","Thứ 4","Thứ 5","Thứ 6","Thứ 7"];
   function weekdayLabel(d){ if (!d) return ''; const dt = new Date(d + 'T00:00:00'); return isNaN(dt) ? '' : WEEKDAYS[dt.getDay()]; }
@@ -51,7 +56,7 @@
 
   let state = {
     members: [], courts: [], sessions: [], settings: { casualMultiplier: 1.5, logoUrl: '', bannerUrl: '' },
-    payments: {}, fund: {},
+    payments: {}, fund: {}, donations: [],
     me: null, myUsername: null, tab: 'sessions', memberFilter: 'all', viewMonth: monthKey(),
     authMode: 'login', authError: '', remember: false
   };
@@ -104,6 +109,7 @@
   const saveSettings = () => save('bc_settings', state.settings);
   const savePayments = () => save('bc_payments', state.payments);
   const saveFund = () => save('bc_fund', state.fund);
+  const saveDonations = () => save('bc_donations', state.donations);
 
   // Luôn lấy bản mới nhất từ database trước khi sửa danh sách thành viên,
   // để tránh 2 người sửa/đăng ký cùng lúc ghi đè làm mất dữ liệu của nhau.
@@ -131,6 +137,18 @@
       state.fund = updated;
       return await save('bc_fund', updated);
     } finally { fundMutating = false; }
+  }
+  let donationsMutating = false;
+  async function mutateDonations(mutator){
+    while (donationsMutating) { await new Promise(r => setTimeout(r, 150)); }
+    donationsMutating = true;
+    try {
+      const latest = await loadKey('bc_donations', state.donations || []);
+      const updated = mutator(latest);
+      if (updated === null) return false;
+      state.donations = updated;
+      return await save('bc_donations', updated);
+    } finally { donationsMutating = false; }
   }
   let membersMutating = false;
   async function mutateMembers(mutator){
@@ -162,6 +180,7 @@
     state.settings = Object.assign({ casualMultiplier: 1.5, logoUrl: '', bannerUrl: '' }, await loadKey('bc_settings', {}));
     state.payments = await loadKey('bc_payments', {});
     state.fund = await loadKey('bc_fund', {});
+    state.donations = await loadKey('bc_donations', []);
     state.myUsername = lsGet('bc_my_username');
     state.rememberData = lsGet('bc_remember');
     if (!state.myUsername && state.rememberData && state.rememberData.username) {
@@ -192,25 +211,27 @@
     let fixedNames = yesNames.filter(n => memberType(n, mKey) === 'fixed');
     let casualNames = yesNames.filter(n => memberType(n, mKey) !== 'fixed');
 
-    // Pass slot: vãng lai nhận pass từ cố định sẽ tính phí như cố định
+    // Pass slot: cố định đã pass coi như vắng nhưng VẪN trả phí cố định như thường,
+    // vãng lai nhận pass được MIỄN PHÍ hoàn toàn (không tính vào mẫu số, không trả tiền)
     const passes = s.passes || {};
-    const passedToNames = []; // tên vãng lai nhận pass (đang trong casualNames và có người pass cho)
-    Object.values(passes).forEach(casualMemberId => {
+    const freeNames = []; // vãng lai được miễn phí do nhận pass
+    Object.entries(passes).forEach(([fixedMemberId, casualMemberId]) => {
       if (!casualMemberId) return;
+      const fixedMember = state.members.find(x => x.id === fixedMemberId);
       const casualMember = state.members.find(x => x.id === casualMemberId);
-      if (casualMember && casualNames.includes(casualMember.name) && !passedToNames.includes(casualMember.name)) {
-        passedToNames.push(casualMember.name);
+      // Người cố định đã pass: đảm bảo vẫn có trong fixedNames để vẫn bị tính phí, dù vote là gì
+      if (fixedMember && !fixedNames.includes(fixedMember.name)) fixedNames.push(fixedMember.name);
+      // Người vãng lai nhận pass: bỏ khỏi danh sách phải trả tiền (miễn phí)
+      if (casualMember) {
+        casualNames = casualNames.filter(n => n !== casualMember.name);
+        if (!freeNames.includes(casualMember.name)) freeNames.push(casualMember.name);
       }
     });
-    if (passedToNames.length) {
-      casualNames = casualNames.filter(n => !passedToNames.includes(n));
-      fixedNames = fixedNames.concat(passedToNames);
-    }
 
     const m = state.settings.casualMultiplier || 1.5;
     const denom = fixedNames.length + m * casualNames.length;
     const unit = denom > 0 ? total / denom : 0;
-    return { total, fixedNames, casualNames, fixedShare: unit, casualShare: unit * m, multiplier: m, passedToNames };
+    return { total, fixedNames, casualNames, fixedShare: unit, casualShare: unit * m, multiplier: m, freeNames };
   }
 
   // ---------- RENDER ROOT ----------
@@ -709,41 +730,50 @@
 
   function fundClosing(month){
     const f = state.fund[month] || { opening: 0, expenses: [] };
-    const summary = computeMemberMonthSummary(month);
-    let income = 0;
+    let incomePaid = 0, incomePrepaid = 0;
     state.members.forEach(m => {
       const p = (state.payments[m.id] || {})[month] || {};
-      income += (p.paid || 0) + (p.prepaid || 0);
+      incomePaid += (p.paid || 0);
+      incomePrepaid += (p.prepaid || 0);
     });
+    const incomeDonate = (state.donations||[]).filter(d => d.month === month).reduce((a,d) => a + (d.amount||0), 0);
+    const income = incomePaid + incomePrepaid + incomeDonate;
     const expenseTotal = (f.expenses || []).reduce((a,e) => a + (e.amount||0), 0);
-    return { opening: f.opening || 0, income, expenseTotal, closing: (f.opening||0) + income - expenseTotal };
+    const sessionsCostTotal = state.sessions
+      .filter(s => sessionMonthKey(s) === month)
+      .reduce((a,s) => {
+        const c = s.costs || {};
+        return a + (c.court||0) + (c.water||0) + (c.shuttle||0) + (c.other||0);
+      }, 0);
+    return {
+      opening: f.opening || 0, incomePaid, incomePrepaid, incomeDonate,
+      income, expenseTotal, sessionsCostTotal,
+      diff: expenseTotal - sessionsCostTotal,
+      closing: (f.opening||0) + income - expenseTotal
+    };
   }
 
   function renderFund(){
     const wrap = el(`<div></div>`);
     const month = state.viewMonth;
+    const today = new Date().toISOString().slice(0,10);
 
     wrap.appendChild(el(`<div style="display:flex; align-items:center; gap:6px; margin-bottom:1rem;">
       <span style="font-size:13px; color:#8a877d;">Tháng xem:</span>
       <input class="bc-input" type="month" id="fund-month" value="${month}" style="width:140px; padding:5px 8px;" />
     </div>`));
 
-    // --- Bảng tổng hợp thành viên ---
-    wrap.appendChild(el(`<h3 style="font-size:15px; color:#1B4332; margin-bottom:8px;">Tổng hợp chi phí thành viên · ${monthLabel(month)}</h3>`));
     const summary = computeMemberMonthSummary(month);
     const rowsMembers = canManage() ? state.members : state.members.filter(m => state.me && m.id === state.me.id);
-
+    wrap.appendChild(el(`<h3 style="font-size:15px; color:#1B4332; margin-bottom:8px;">Tổng hợp chi phí thành viên · ${monthLabel(month)}</h3>`));
     if (rowsMembers.length === 0) {
       wrap.appendChild(el(`<div class="bc-empty">Không có dữ liệu.</div>`));
     } else {
       const tbl = el(`<div class="bc-card" style="overflow-x:auto;"><table style="width:100%; font-size:13px; border-collapse:collapse; min-width:560px;">
         <tr style="color:#8a877d; text-align:left;">
-          <th style="padding:6px 4px;">Thành viên</th>
-          <th style="padding:6px 4px;">Buổi</th>
-          <th style="padding:6px 4px; text-align:right;">Phải trả</th>
-          <th style="padding:6px 4px; text-align:right;">Đã nộp</th>
-          <th style="padding:6px 4px; text-align:right;">Nộp trước</th>
-          <th style="padding:6px 4px; text-align:right;">Còn lại</th>
+          <th style="padding:6px 4px;">Thành viên</th><th style="padding:6px 4px;">Buổi</th>
+          <th style="padding:6px 4px; text-align:right;">Phải trả</th><th style="padding:6px 4px; text-align:right;">Đã nộp</th>
+          <th style="padding:6px 4px; text-align:right;">Nộp trước</th><th style="padding:6px 4px; text-align:right;">Còn lại</th>
         </tr>
       </table></div>`);
       const table = tbl.querySelector('table');
@@ -788,11 +818,61 @@
       }
     }
 
+    // --- Donate ---
+    wrap.appendChild(el(`<h3 style="font-size:15px; color:#1B4332; margin:1.25rem 0 8px;">Donate công khai · ${monthLabel(month)}</h3>`));
+    const monthDonations = (state.donations||[]).filter(d => d.month === month);
+    if (canManage()) {
+      const donateForm = el(`<div class="bc-card">
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <select class="bc-select" id="don-member" style="flex:2; min-width:140px;">
+            <option value="">Chọn thành viên donate...</option>
+            ${state.members.map(m => `<option value="${m.id}">${escapeHtml(m.name)}</option>`).join('')}
+          </select>
+          <input class="bc-input" type="number" min="0" id="don-amount" placeholder="Số tiền donate" style="flex:1; min-width:110px;" />
+          <input class="bc-input" type="date" id="don-date" value="${today}" style="flex:1; min-width:130px;" />
+          <input class="bc-input" id="don-note" placeholder="Ghi chú (tuỳ chọn)" style="flex:2; min-width:130px;" />
+          <button class="bc-btn" id="don-add">Thêm</button>
+        </div>
+      </div>`);
+      wrap.appendChild(donateForm);
+      setTimeout(() => {
+        document.getElementById('don-add').onclick = async () => {
+          const mid = document.getElementById('don-member').value;
+          const amount = parseFloat(document.getElementById('don-amount').value) || 0;
+          const date = document.getElementById('don-date').value || today;
+          const note = document.getElementById('don-note').value.trim();
+          if (!mid || !amount) return;
+          const mem = state.members.find(x => x.id === mid);
+          await mutateDonations(latest => latest.concat([{ id: uid(), memberId: mid, memberName: mem ? mem.name : '?', amount, date, note, month }]));
+          render();
+        };
+      }, 0);
+    }
+    if (monthDonations.length === 0) {
+      wrap.appendChild(el(`<div style="font-size:13px; color:#8a877d; margin-bottom:1rem;">Chưa có ai donate tháng này.</div>`));
+    } else {
+      const donList = el(`<div class="bc-card" style="margin-bottom:1rem;"></div>`);
+      monthDonations.forEach(d => {
+        const row = el(`<div style="display:flex; justify-content:space-between; align-items:center; padding:5px 0; border-top:1px solid #F1EFE8; font-size:13px;">
+          <span>🎁 <strong>${escapeHtml(d.memberName)}</strong>${d.note ? ' · ' + escapeHtml(d.note) : ''} <span style="color:#8a877d;">(${d.date||''})</span></span>
+          <span style="display:flex; align-items:center; gap:8px;">
+            <strong style="color:#27500A;">+${formatVND(d.amount)}</strong>
+            ${canDelete() ? `<button class="bc-btn danger small" data-did="${d.id}">Xoá</button>` : ''}
+          </span>
+        </div>`);
+        if (canDelete()) row.querySelector('button').onclick = async () => {
+          await mutateDonations(latest => latest.filter(x => x.id !== d.id));
+          render();
+        };
+        donList.appendChild(row);
+      });
+      wrap.appendChild(donList);
+    }
+
     // --- Quỹ nhóm ---
     wrap.appendChild(el(`<h3 style="font-size:15px; color:#1B4332; margin:1.25rem 0 8px;">Quỹ nhóm · ${monthLabel(month)}</h3>`));
     const f = state.fund[month] || { opening: 0, expenses: [] };
     const closing = fundClosing(month);
-
     if (canManage()) {
       const openingCard = el(`<div class="bc-card" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
         <span style="font-size:13px; color:#6b7a73;">Tồn đầu tháng:</span>
@@ -801,10 +881,22 @@
         <button class="bc-btn small" id="fund-opening-save">Lưu</button>
       </div>`);
       wrap.appendChild(openingCard);
+      const expForm = el(`<div class="bc-card">
+        <h4 style="font-size:14px; margin-bottom:8px; color:#1B4332;">Thêm khoản chi</h4>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <select class="bc-select" id="exp-cat" style="flex:1; min-width:120px;">
+            <option>Tiền sân</option><option>Tiền nước</option><option>Tiền cầu</option><option>Liên hoan</option><option>Khác</option>
+          </select>
+          <input class="bc-input" id="exp-label" placeholder="Ghi chú" style="flex:2; min-width:140px;" />
+          <input class="bc-input" type="number" min="0" id="exp-amount" placeholder="Số tiền" style="flex:1; min-width:100px;" />
+          <input class="bc-input" type="date" id="exp-date" value="${today}" style="flex:1; min-width:130px;" />
+          <button class="bc-btn" id="exp-add">Thêm</button>
+        </div>
+      </div>`);
+      wrap.appendChild(expForm);
       setTimeout(() => {
         document.getElementById('fund-carry').onclick = () => {
-          const prevClosing = fundClosing(prevMonthKey(month)).closing;
-          document.getElementById('fund-opening').value = Math.round(prevClosing);
+          document.getElementById('fund-opening').value = Math.round(fundClosing(prevMonthKey(month)).closing);
         };
         document.getElementById('fund-opening-save').onclick = async () => {
           const val = parseFloat(document.getElementById('fund-opening').value) || 0;
@@ -815,30 +907,16 @@
           });
           render();
         };
-      }, 0);
-
-      const expForm = el(`<div class="bc-card">
-        <h4 style="font-size:14px; margin-bottom:8px; color:#1B4332;">Thêm khoản chi</h4>
-        <div style="display:flex; gap:8px; flex-wrap:wrap;">
-          <select class="bc-select" id="exp-cat" style="flex:1; min-width:120px;">
-            <option>Tiền sân</option><option>Tiền nước</option><option>Tiền cầu</option><option>Liên hoan</option><option>Khác</option>
-          </select>
-          <input class="bc-input" id="exp-label" placeholder="Ghi chú" style="flex:2; min-width:140px;" />
-          <input class="bc-input" id="exp-amount" type="number" min="0" placeholder="Số tiền" style="flex:1; min-width:100px;" />
-          <button class="bc-btn" id="exp-add">Thêm</button>
-        </div>
-      </div>`);
-      wrap.appendChild(expForm);
-      setTimeout(() => {
         document.getElementById('exp-add').onclick = async () => {
           const category = document.getElementById('exp-cat').value;
           const label = document.getElementById('exp-label').value.trim();
           const amount = parseFloat(document.getElementById('exp-amount').value) || 0;
+          const date = document.getElementById('exp-date').value || today;
           if (!amount) return;
           await mutateFund(latest => {
             const updated = Object.assign({}, latest);
             const cur = updated[month] || { opening: 0, expenses: [] };
-            updated[month] = Object.assign({}, cur, { expenses: (cur.expenses||[]).concat([{ id: uid(), category, label, amount }]) });
+            updated[month] = Object.assign({}, cur, { expenses: (cur.expenses||[]).concat([{ id: uid(), category, label, amount, date }]) });
             return updated;
           });
           render();
@@ -846,15 +924,40 @@
       }, 0);
     }
 
+    // --- Sổ thu/chi ---
+    const ledgerEntries = [];
+    state.members.forEach(m => {
+      const p = (state.payments[m.id] || {})[month] || {};
+      if (p.paid) ledgerEntries.push({ date: month+'-01', type: 'income', label: 'Thu tiền nộp: ' + m.name, amount: p.paid });
+      if (p.prepaid) ledgerEntries.push({ date: month+'-01', type: 'income', label: 'Nộp trước: ' + m.name, amount: p.prepaid });
+    });
+    monthDonations.forEach(d => ledgerEntries.push({ date: d.date||month+'-01', type: 'income', label: 'Donate: ' + d.memberName + (d.note?' ('+d.note+')':''), amount: d.amount }));
+    (f.expenses||[]).forEach(e => ledgerEntries.push({ date: e.date||month+'-01', type: 'expense', label: e.category + (e.label?' · '+e.label:''), amount: e.amount }));
+    ledgerEntries.sort((a,b) => a.date.localeCompare(b.date));
+
+    if (ledgerEntries.length) {
+      const ledger = el(`<div class="bc-card"><div style="font-size:13px; font-weight:500; color:#1B4332; margin-bottom:6px;">Sổ thu/chi tháng ${monthLabel(month)}</div></div>`);
+      const ltbl = el(`<table style="width:100%; font-size:13px; border-collapse:collapse;"><tr style="color:#8a877d; font-size:12px;"><th style="padding:4px; text-align:left;">Ngày</th><th style="padding:4px; text-align:left;">Nội dung</th><th style="padding:4px; text-align:right;">Số tiền</th></tr></table>`);
+      ledgerEntries.forEach(e => {
+        const inc = e.type === 'income';
+        ltbl.appendChild(el(`<tr style="border-top:1px solid #F1EFE8;">
+          <td style="padding:5px 4px; color:#8a877d; white-space:nowrap;">${e.date}</td>
+          <td style="padding:5px 4px;">${escapeHtml(e.label)}</td>
+          <td style="padding:5px 4px; text-align:right; font-weight:500; color:${inc?'#222':'#993C1D'};">${inc?'+':'-'}${formatVND(e.amount)}</td>
+        </tr>`));
+      });
+      ledger.appendChild(ltbl);
+      wrap.appendChild(ledger);
+    }
+
     if ((f.expenses||[]).length) {
-      const expList = el(`<div class="bc-card"></div>`);
-      expList.appendChild(el(`<div style="font-size:13px; font-weight:500; color:#1B4332; margin-bottom:6px;">Các khoản chi trong tháng</div>`));
+      const expList = el(`<div class="bc-card"><div style="font-size:13px; font-weight:500; color:#1B4332; margin-bottom:6px;">Khoản chi trong tháng</div></div>`);
       (f.expenses||[]).forEach(e => {
         const row = el(`<div style="display:flex; justify-content:space-between; align-items:center; padding:4px 0; border-top:1px solid #F1EFE8; font-size:13px;">
-          <span>${escapeHtml(e.category)}${e.label ? ' · ' + escapeHtml(e.label) : ''}</span>
+          <span>${e.date?`<span style="color:#8a877d;">${e.date} · </span>`:''}${escapeHtml(e.category)}${e.label?' · '+escapeHtml(e.label):''}</span>
           <span style="display:flex; align-items:center; gap:8px;">
-            <strong style="font-weight:500;">${formatVND(e.amount)}</strong>
-            ${canDelete() ? `<button class="bc-btn danger small" data-id="${e.id}">Xoá</button>` : ''}
+            <strong style="color:#993C1D;">-${formatVND(e.amount)}</strong>
+            ${canDelete()?`<button class="bc-btn danger small" data-id="${e.id}">Xoá</button>`:''}
           </span>
         </div>`);
         if (canDelete()) row.querySelector('button').onclick = async () => {
@@ -871,17 +974,31 @@
       wrap.appendChild(expList);
     }
 
-    wrap.appendChild(el(`<div class="bc-card" style="background:#F4F1EA; font-size:13px; color:#6b7a73; display:flex; gap:16px; flex-wrap:wrap;">
-      <span>Tồn đầu: <strong style="color:#1B4332; font-weight:500;">${formatVND(closing.opening)}</strong></span>
-      <span>Thu (đã nộp + nộp trước): <strong style="color:#27500A; font-weight:500;">${formatVND(closing.income)}</strong></span>
-      <span>Chi: <strong style="color:#993C1D; font-weight:500;">${formatVND(closing.expenseTotal)}</strong></span>
-      <span>Tồn cuối: <strong style="color:#1B4332; font-weight:600;">${formatVND(closing.closing)}</strong></span>
+    wrap.appendChild(el(`<div class="bc-card" style="background:#F4F1EA; font-size:13px;">
+      <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:baseline;">
+        <span style="color:#6b7a73;">Tồn đầu: <strong style="color:#1B4332;">${formatVND(closing.opening)}</strong></span>
+        <span style="color:#6b7a73;">Thu nộp: <strong style="color:#222;">+${formatVND(closing.incomePaid)}</strong></span>
+        <span style="color:#6b7a73;">Nộp trước: <strong style="color:#222;">+${formatVND(closing.incomePrepaid)}</strong></span>
+        <span style="color:#6b7a73;">Donate: <strong style="color:#222;">+${formatVND(closing.incomeDonate)}</strong></span>
+        <span style="color:#6b7a73;">Chi: <strong style="color:#993C1D;">-${formatVND(closing.expenseTotal)}</strong></span>
+        <span style="color:#6b7a73; font-size:14px;">Tồn cuối: <strong style="color:#1B4332; font-size:15px;">${formatVND(closing.closing)}</strong></span>
+      </div>
+    </div>`));
+
+    const diffOk = Math.abs(closing.diff) < 1;
+    wrap.appendChild(el(`<div class="bc-card" style="background:${diffOk?'#EAF3DE':'#FAECE7'}; font-size:13px; color:${diffOk?'#27500A':'#993C1D'};">
+      <div style="font-weight:500; margin-bottom:6px;">📊 Đối chiếu chi phí buổi tập vs quỹ · ${monthLabel(month)}</div>
+      <div style="display:flex; gap:16px; flex-wrap:wrap; margin-bottom:4px;">
+        <span>Chi phí ghi trong quỹ: <strong>-${formatVND(closing.expenseTotal)}</strong></span>
+        <span>Chi phí tính từ buổi tập: <strong>-${formatVND(closing.sessionsCostTotal)}</strong></span>
+        <span>Chênh lệch: <strong>${closing.diff>=0?'+':''}${formatVND(closing.diff)}</strong></span>
+      </div>
+      <div>${diffOk ? '✅ Khớp — chi phí quỹ đúng với tổng buổi tập.' : '⚠️ Lệch ' + formatVND(Math.abs(closing.diff)) + ' — kiểm tra lại khoản chi trong quỹ và chi phí từng buổi tập. Lệch do liên hoan/mua đồ riêng là bình thường.'}</div>
     </div>`));
 
     setTimeout(() => {
       document.getElementById('fund-month').onchange = (e) => { state.viewMonth = e.target.value || monthKey(); render(); };
     }, 0);
-
     return wrap;
   }
 
@@ -1063,7 +1180,10 @@
       state.members.forEach(m => {
         const v = s.votes[m.name];
         const t = memberType(m.name, mKey);
-        const statusBadge = v === 'yes'
+        const hasPassed = t === 'fixed' && passes[m.id];
+        const statusBadge = hasPassed
+          ? `<span class="bc-badge" style="background:#FAEEDA; color:#854F0B;">Đã pass (tính vắng)</span>`
+          : v === 'yes'
           ? `<span class="bc-badge" style="background:#EAF3DE; color:#27500A;">Tham gia</span>`
           : v === 'no'
             ? `<span class="bc-badge" style="background:#FAECE7; color:#993C1D;">Vắng</span>`
@@ -1115,6 +1235,7 @@
 
     const costBox = card.querySelector(`#cost-${s.id}`);
     costBox.appendChild(el(`<div style="font-size:13px; font-weight:500; color:#1B4332; margin-bottom:6px;">Chi phí buổi này</div>`));
+    s.penalties = s.penalties || {};
     if (canManage()) {
       const costForm = el(`<div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(120px,1fr)); gap:8px; margin-bottom:8px;">
         <div><label style="font-size:12px; color:#8a877d;">Tiền sân</label><input class="bc-input" type="number" min="0" id="cost-court-${s.id}" value="${s.costs.court}" /></div>
@@ -1123,23 +1244,82 @@
         <div><label style="font-size:12px; color:#8a877d;">Phát sinh khác</label><input class="bc-input" type="number" min="0" id="cost-other-${s.id}" value="${s.costs.other}" /></div>
       </div>`);
       costBox.appendChild(costForm);
-      costBox.appendChild(el(`<button class="bc-btn outline small" id="cost-save-${s.id}">Lưu chi phí</button>`));
+      costBox.appendChild(el(`<button class="bc-btn outline small" id="cost-save-${s.id}" style="margin-bottom:10px;">Lưu chi phí</button>`));
+
+      // Phạt đi trễ
+      const penaltySection = el(`<div style="margin-top:6px; border-top:1px dashed #E3E0D6; padding-top:8px;">
+        <div style="font-size:13px; font-weight:500; color:#854F0B; margin-bottom:6px;">Phạt đi trễ</div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:6px;">
+          <select class="bc-select" id="pen-member-${s.id}" style="flex:2; min-width:140px;">
+            <option value="">Chọn thành viên...</option>
+            ${state.members.filter(m => s.votes[m.name]==='yes').map(m => `<option value="${m.id}">${escapeHtml(m.name)}</option>`).join('')}
+          </select>
+          <input class="bc-input" type="number" min="0" id="pen-amount-${s.id}" placeholder="Số tiền phạt" style="flex:1; min-width:100px;" />
+          <button class="bc-btn small" id="pen-add-${s.id}">Thêm phạt</button>
+        </div>
+        <div id="pen-list-${s.id}"></div>
+      </div>`);
+      costBox.appendChild(penaltySection);
+
+      // Render danh sách phạt
+      const penList = penaltySection.querySelector(`#pen-list-${s.id}`);
+      Object.entries(s.penalties).forEach(([mid, penAmt]) => {
+        if (!penAmt) return;
+        const mem = state.members.find(x => x.id === mid);
+        if (!mem) return;
+        const row = el(`<div style="display:flex; justify-content:space-between; align-items:center; font-size:13px; border-top:1px solid #F1EFE8; padding:4px 0;">
+          <span style="color:#854F0B;">⚠ ${escapeHtml(mem.name)} đi trễ</span>
+          <span style="display:flex; align-items:center; gap:8px;">
+            <strong style="color:#993C1D;">${formatVND(penAmt)}</strong>
+            <button class="bc-btn danger small" data-penid="${mid}">Xoá</button>
+          </span>
+        </div>`);
+        row.querySelector('button').onclick = () => { delete s.penalties[mid]; saveSessions(); render(); };
+        penList.appendChild(row);
+      });
     }
+
+    // Tổng phạt cho mỗi người
+    const penaltyMap = {};
+    Object.entries(s.penalties||{}).forEach(([mid, amt]) => { penaltyMap[mid] = amt || 0; });
 
     if (shares.total > 0) {
       costBox.appendChild(el(`<div style="margin-top:10px; font-size:13px; color:#6b7a73;">
-        Tổng chi phí: <strong style="color:#1B4332; font-weight:500;">${formatVND(shares.total)}</strong>
-        · Mỗi người cố định: <strong style="color:#1B4332; font-weight:500;">${formatVND(shares.fixedShare)}</strong>
-        · Mỗi người vãng lai (×${shares.multiplier}): <strong style="color:#1B4332; font-weight:500;">${formatVND(shares.casualShare)}</strong>
+        Tổng chi phí chia đều: <strong style="color:#1B4332; font-weight:500;">${formatVND(shares.total)}</strong>
+        · Cố định: <strong style="color:#1B4332; font-weight:500;">${formatVND(shares.fixedShare)}</strong>
+        · Vãng lai (×${shares.multiplier}): <strong style="color:#1B4332; font-weight:500;">${formatVND(shares.casualShare)}</strong>
       </div>`));
-      if (shares.fixedNames.length || shares.casualNames.length) {
+      const allPayers = [...shares.fixedNames.map(n => ({ name: n, type: 'fixed', base: shares.fixedShare })),
+                         ...shares.casualNames.map(n => ({ name: n, type: 'casual', base: shares.casualShare })),
+                         ...shares.freeNames.map(n => ({ name: n, type: 'free', base: 0 }))];
+      if (allPayers.length) {
         const detail = el(`<table style="width:100%; font-size:13px; border-collapse:collapse; margin-top:8px;"></table>`);
-        shares.fixedNames.forEach(name => detail.appendChild(el(`<tr style="border-top:1px solid #F1EFE8;">
-          <td style="padding:5px 4px;">${escapeHtml(name)}</td><td style="padding:5px 4px; color:#8a877d;">${shares.passedToNames.includes(name) ? 'Vãng lai (nhận pass)' : 'Cố định'}</td>
-          <td style="padding:5px 4px; text-align:right; font-weight:500;">${formatVND(shares.fixedShare)}</td></tr>`)));
-        shares.casualNames.forEach(name => detail.appendChild(el(`<tr style="border-top:1px solid #F1EFE8;">
-          <td style="padding:5px 4px;">${escapeHtml(name)}</td><td style="padding:5px 4px; color:#8a877d;">Vãng lai</td>
-          <td style="padding:5px 4px; text-align:right; font-weight:500;">${formatVND(shares.casualShare)}</td></tr>`)));
+        const hdr = el(`<tr style="color:#8a877d; font-size:12px;"><th style="padding:4px; text-align:left;">Thành viên</th><th style="padding:4px; text-align:left;">Loại</th><th style="padding:4px; text-align:right;">Chi phí</th><th style="padding:4px; text-align:right;">Phạt trễ</th><th style="padding:4px; text-align:right;">Tổng phải trả</th></tr>`);
+        detail.appendChild(hdr);
+        allPayers.forEach(p => {
+          const mem = state.members.find(x => x.name === p.name);
+          const pen = mem ? (penaltyMap[mem.id] || 0) : 0;
+          const typeLabel = p.type === 'fixed' ? 'Cố định' : p.type === 'free' ? '<span style="color:#27500A">Miễn phí (nhận pass)</span>' : 'Vãng lai';
+          detail.appendChild(el(`<tr style="border-top:1px solid #F1EFE8;">
+            <td style="padding:5px 4px;">${escapeHtml(p.name)}</td>
+            <td style="padding:5px 4px; color:#8a877d;">${typeLabel}</td>
+            <td style="padding:5px 4px; text-align:right;">${formatVND(p.base)}</td>
+            <td style="padding:5px 4px; text-align:right; color:#854F0B;">${pen ? formatVND(pen) : '—'}</td>
+            <td style="padding:5px 4px; text-align:right; font-weight:600; color:#1B4332;">${formatVND(p.base + pen)}</td>
+          </tr>`));
+        });
+        // Người cố định đã pass
+        shares.passedFromNames && shares.passedFromNames.forEach(name => {
+          const pen = state.members.find(x => x.name === name);
+          const penAmt = pen ? (penaltyMap[pen.id] || 0) : 0;
+          detail.appendChild(el(`<tr style="border-top:1px solid #F1EFE8; opacity:.7;">
+            <td style="padding:5px 4px;">${escapeHtml(name)}</td>
+            <td style="padding:5px 4px; color:#8a877d;">Cố định (đã pass)</td>
+            <td style="padding:5px 4px; text-align:right;">${formatVND(shares.fixedShare)}</td>
+            <td style="padding:5px 4px; text-align:right; color:#854F0B;">${penAmt ? formatVND(penAmt) : '—'}</td>
+            <td style="padding:5px 4px; text-align:right; font-weight:600; color:#1B4332;">${formatVND(shares.fixedShare + penAmt)}</td>
+          </tr>`));
+        });
         costBox.appendChild(detail);
       }
     } else if (canManage()) {
@@ -1154,6 +1334,15 @@
           shuttle: parseFloat(document.getElementById(`cost-shuttle-${s.id}`).value) || 0,
           other: parseFloat(document.getElementById(`cost-other-${s.id}`).value) || 0
         };
+        saveSessions(); render();
+      };
+      const penAddBtn = document.getElementById(`pen-add-${s.id}`);
+      if (penAddBtn) penAddBtn.onclick = () => {
+        const mid = document.getElementById(`pen-member-${s.id}`).value;
+        const amt = parseFloat(document.getElementById(`pen-amount-${s.id}`).value) || 0;
+        if (!mid || !amt) return;
+        s.penalties = s.penalties || {};
+        s.penalties[mid] = (s.penalties[mid] || 0) + amt;
         saveSessions(); render();
       };
     }, 0);
