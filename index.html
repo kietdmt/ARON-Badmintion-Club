@@ -58,7 +58,9 @@
     members: [], courts: [], sessions: [], settings: { casualMultiplier: 1.5, logoUrl: '', bannerUrl: '' },
     payments: {}, fund: {}, donations: [],
     me: null, myUsername: null, tab: 'sessions', memberFilter: 'all', viewMonth: monthKey(),
-    authMode: 'login', authError: '', remember: false
+    authMode: 'login', authError: '', remember: false,
+    sessionSearchDate: '', sessionSearchCourt: '', pastVisibleCount: 3,
+    memberSearch: '', memberVisibleCount: 15
   };
 
   // ---------- Quyền ----------
@@ -469,27 +471,64 @@
     }
 
     const filterBar = el(`<div style="display:flex; gap:6px; margin-bottom:0.75rem; flex-wrap:wrap; align-items:center;">
-      <div style="display:flex; gap:6px;">
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
         ${[['all','Tất cả'],['active','Hoạt động'],['inactive','Ngưng hoạt động']].map(([k,l]) =>
           `<div class="bc-tab ${state.memberFilter===k?'active':''}" data-filter="${k}" style="font-size:13px; padding:5px 12px;">${l}</div>`).join('')}
       </div>
-      <div style="margin-left:auto; display:flex; align-items:center; gap:6px;">
+      <div style="margin-left:auto; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
         <span style="font-size:13px; color:#8a877d;">Tháng xem:</span>
         <input class="bc-input" type="month" id="mb-view-month" value="${state.viewMonth}" style="width:140px; padding:4px 8px;" />
       </div>
     </div>`);
     wrap.appendChild(filterBar);
 
-    const filtered = state.members.filter(m => state.memberFilter === 'all' ? true : m.status === state.memberFilter);
+    // Search thanh viên theo tên
+    const searchBar = el(`<div style="display:flex; gap:8px; align-items:center; margin-bottom:0.75rem;">
+      <input class="bc-input" id="mb-search" placeholder="🔍  Tìm theo tên thành viên..." value="${escapeHtml(state.memberSearch)}" style="max-width:320px;" />
+      ${state.memberSearch ? `<button class="bc-btn outline small" id="mb-search-clear">✕ Xoá</button>` : ''}
+    </div>`);
+    wrap.appendChild(searchBar);
+
+    let filtered = state.members.filter(m => state.memberFilter === 'all' ? true : m.status === state.memberFilter);
+    if (state.memberSearch) {
+      const kw = state.memberSearch.toLowerCase();
+      filtered = filtered.filter(m => m.name.toLowerCase().includes(kw) || (m.username||'').toLowerCase().includes(kw));
+    }
+
+    const MPAGE = 12;
+    const totalPages = Math.max(1, Math.ceil(filtered.length / MPAGE));
+    if (state.memberVisibleCount > totalPages) state.memberVisibleCount = totalPages;
+    const page = Math.max(0, Math.min((state.memberVisibleCount||0), totalPages - 1));
+    const pageItems = filtered.slice().reverse().slice(page * MPAGE, (page + 1) * MPAGE);
+
     if (filtered.length === 0) {
-      wrap.appendChild(el(`<div class="bc-empty">Không có thành viên nào trong nhóm này.</div>`));
+      wrap.appendChild(el(`<div class="bc-empty">${state.memberSearch ? 'Không tìm thấy thành viên nào.' : 'Không có thành viên nào trong nhóm này.'}</div>`));
     } else {
-      filtered.slice().reverse().forEach(m => wrap.appendChild(renderMemberRow(m)));
+      pageItems.forEach(m => wrap.appendChild(renderMemberRow(m)));
+      if (totalPages > 1) {
+        const paginator = el(`<div style="display:flex; align-items:center; justify-content:center; gap:8px; margin-top:0.5rem; font-size:13px; color:#6b7a73;"></div>`);
+        if (page > 0) {
+          const prev = el(`<button class="bc-btn outline small">◀ Trước</button>`);
+          prev.onclick = () => { state.memberVisibleCount = page - 1; render(); };
+          paginator.appendChild(prev);
+        }
+        paginator.appendChild(el(`<span>Trang ${page+1} / ${totalPages} (${filtered.length} thành viên)</span>`));
+        if (page < totalPages - 1) {
+          const next = el(`<button class="bc-btn outline small">Tiếp ▶</button>`);
+          next.onclick = () => { state.memberVisibleCount = page + 1; render(); };
+          paginator.appendChild(next);
+        }
+        wrap.appendChild(paginator);
+      }
     }
 
     setTimeout(() => {
       document.getElementById('mb-view-month').onchange = (e) => { state.viewMonth = e.target.value || monthKey(); render(); };
-      filterBar.querySelectorAll('[data-filter]').forEach(n => n.onclick = () => { state.memberFilter = n.dataset.filter; render(); });
+      filterBar.querySelectorAll('[data-filter]').forEach(n => n.onclick = () => { state.memberFilter = n.dataset.filter; state.memberVisibleCount = 0; render(); });
+      const mbSearch = document.getElementById('mb-search');
+      if (mbSearch) mbSearch.oninput = (e) => { state.memberSearch = e.target.value; state.memberVisibleCount = 0; render(); };
+      const mbClear = document.getElementById('mb-search-clear');
+      if (mbClear) mbClear.onclick = () => { state.memberSearch = ''; state.memberVisibleCount = 0; render(); };
     }, 0);
 
     return wrap;
@@ -1100,21 +1139,82 @@
     }
 
     const nowStamp = (new Date()).toISOString().slice(0,16).replace('T','');
-    const all = state.sessions.slice();
+    let all = state.sessions.slice();
+
+    // --- Thanh lọc ---
+    const searchCard = el(`<div class="bc-card" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+      <span style="font-size:13px; color:#8a877d; white-space:nowrap;">Lọc buổi:</span>
+      <input class="bc-input" type="month" id="search-month" value="${state.sessionSearchDate}" placeholder="Tháng" style="width:145px; padding:5px 8px;" />
+      <select class="bc-select" id="search-court" style="flex:1; min-width:150px; padding:5px 8px;">
+        <option value="">Tất cả sân</option>
+        ${state.courts.map(c => `<option value="${c.id}" ${state.sessionSearchCourt===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('')}
+      </select>
+      ${(state.sessionSearchDate || state.sessionSearchCourt) ? `<button class="bc-btn outline small" id="search-clear">✕ Xoá lọc</button>` : ''}
+      <span style="font-size:12px; color:#8a877d; margin-left:auto;">${all.length} buổi tổng cộng</span>
+    </div>`);
+    wrap.appendChild(searchCard);
+    setTimeout(() => {
+      document.getElementById('search-month').onchange = (e) => { state.sessionSearchDate = e.target.value; state.upcomingPage = 0; render(); };
+      document.getElementById('search-court').onchange = (e) => { state.sessionSearchCourt = e.target.value; state.upcomingPage = 0; render(); };
+      const clearBtn = document.getElementById('search-clear');
+      if (clearBtn) clearBtn.onclick = () => { state.sessionSearchDate = ''; state.sessionSearchCourt = ''; state.upcomingPage = 0; render(); };
+    }, 0);
+
+    if (state.sessionSearchDate) all = all.filter(s => s.date && s.date.slice(0,7) === state.sessionSearchDate);
+    if (state.sessionSearchCourt) all = all.filter(s => s.courtId === state.sessionSearchCourt);
+    const isFiltering = !!(state.sessionSearchDate || state.sessionSearchCourt);
+
     const upcoming = all.filter(s => (s.date + (s.time||'00:00')) >= nowStamp).sort((a,b) => (a.date+a.time).localeCompare(b.date+b.time));
     const past = all.filter(s => (s.date + (s.time||'00:00')) < nowStamp).sort((a,b) => (b.date+b.time).localeCompare(a.date+a.time));
 
+    const SPAGE = 4; // buổi sắp tới mỗi trang
+
     if (all.length === 0) {
-      wrap.appendChild(el(`<div class="bc-empty">Chưa có buổi đánh nào.${canManage() ? ' Tạo buổi đầu tiên ở trên.' : ' Hãy đợi Admin/R1 tạo buổi.'}</div>`));
+      wrap.appendChild(el(`<div class="bc-empty">${isFiltering ? 'Không tìm thấy buổi đánh phù hợp.' : 'Chưa có buổi đánh nào.' + (canManage() ? ' Tạo buổi đầu tiên ở trên.' : ' Hãy đợi Admin/R1 tạo buổi.')}</div>`));
     } else {
-      if (upcoming.length === 0) {
-        wrap.appendChild(el(`<div class="bc-empty">Không có buổi sắp tới.</div>`));
-      } else {
-        upcoming.forEach(s => wrap.appendChild(renderSessionCard(s)));
+      // --- UPCOMING: phân trang ---
+      if (upcoming.length === 0 && !isFiltering) {
+        wrap.appendChild(el(`<div class="bc-empty">Không có buổi sắp tới. Các buổi cũ bên dưới.</div>`));
+      } else if (upcoming.length > 0) {
+        const uPage = state.upcomingPage || 0;
+        const uTotal = Math.ceil(upcoming.length / SPAGE);
+        const uSlice = upcoming.slice(uPage * SPAGE, (uPage + 1) * SPAGE);
+        if (upcoming.length > SPAGE) {
+          wrap.appendChild(el(`<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">
+            <span style="font-size:13px; font-weight:500; color:#1B4332;">Buổi sắp tới (${upcoming.length})</span>
+            <div style="display:flex; gap:6px; align-items:center; font-size:13px; color:#6b7a73;">
+              ${uPage > 0 ? `<button class="bc-btn outline small" id="up-prev">◀</button>` : '<span></span>'}
+              <span>Trang ${uPage+1}/${uTotal}</span>
+              ${uPage < uTotal-1 ? `<button class="bc-btn outline small" id="up-next">▶</button>` : '<span></span>'}
+            </div>
+          </div>`));
+          setTimeout(() => {
+            const prev = document.getElementById('up-prev');
+            const next = document.getElementById('up-next');
+            if (prev) prev.onclick = () => { state.upcomingPage = uPage - 1; render(); };
+            if (next) next.onclick = () => { state.upcomingPage = uPage + 1; render(); };
+          }, 0);
+        }
+        uSlice.forEach(s => wrap.appendChild(renderSessionCard(s)));
       }
-      if (past.length) {
-        wrap.appendChild(el(`<div style="font-size:13px; font-weight:500; color:#8a877d; margin:1rem 0 0.5rem;">Buổi đã qua</div>`));
-        past.forEach(s => wrap.appendChild(renderSessionCard(s)));
+
+      // --- PAST: thu gọn mặc định, bấm để mở ---
+      if (past.length > 0) {
+        const pastExpanded = state.pastExpanded || isFiltering;
+        const pastVisible = pastExpanded ? past : past.slice(0, 2);
+        const header = el(`<div style="display:flex; align-items:center; justify-content:space-between; margin:1rem 0 0.5rem; cursor:pointer;" id="past-header">
+          <span style="font-size:13px; font-weight:500; color:#8a877d;">Buổi đã qua (${past.length})</span>
+          ${!isFiltering ? `<button class="bc-btn outline small">${pastExpanded ? '▲ Thu gọn' : '▼ Xem tất cả'}</button>` : ''}
+        </div>`);
+        wrap.appendChild(header);
+        pastVisible.forEach(s => wrap.appendChild(renderSessionCard(s)));
+        if (!isFiltering && !pastExpanded && past.length > 2) {
+          wrap.appendChild(el(`<div style="font-size:13px; color:#8a877d; text-align:center; margin-top:4px;">... và ${past.length - 2} buổi cũ hơn</div>`));
+        }
+        setTimeout(() => {
+          const ph = document.getElementById('past-header');
+          if (ph) ph.onclick = () => { state.pastExpanded = !state.pastExpanded; state.pastPage = 0; render(); };
+        }, 0);
       }
     }
     return wrap;
@@ -1401,7 +1501,7 @@
   let autoRefreshTimer = null;
   function startAutoRefresh(){
     if (autoRefreshTimer) return;
-    autoRefreshTimer = setInterval(refreshAll, 7000);
+    autoRefreshTimer = setInterval(refreshAll, 10000);
     document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshAll(); });
     window.addEventListener('focus', () => refreshAll());
   }
