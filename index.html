@@ -206,34 +206,53 @@
   }
 
   function computeShares(s){
-    const costs = s.costs || { court: 0, water: 0, shuttle: 0, other: 0 };
-    const total = (costs.court||0) + (costs.water||0) + (costs.shuttle||0) + (costs.other||0);
     const mKey = sessionMonthKey(s);
     const yesNames = Object.entries(s.votes).filter(([,v]) => v === 'yes').map(([name]) => name);
     let fixedNames = yesNames.filter(n => memberType(n, mKey) === 'fixed');
     let casualNames = yesNames.filter(n => memberType(n, mKey) !== 'fixed');
 
-    // Pass slot: cố định đã pass coi như vắng nhưng VẪN trả phí cố định như thường,
-    // vãng lai nhận pass được MIỄN PHÍ hoàn toàn (không tính vào mẫu số, không trả tiền)
+    // Pass slot: cố định đã pass vẫn trả phí; vãng lai nhận pass MIỄN PHÍ
     const passes = s.passes || {};
-    const freeNames = []; // vãng lai được miễn phí do nhận pass
+    const freeNames = [];
     Object.entries(passes).forEach(([fixedMemberId, casualMemberId]) => {
       if (!casualMemberId) return;
       const fixedMember = state.members.find(x => x.id === fixedMemberId);
       const casualMember = state.members.find(x => x.id === casualMemberId);
-      // Người cố định đã pass: đảm bảo vẫn có trong fixedNames để vẫn bị tính phí, dù vote là gì
       if (fixedMember && !fixedNames.includes(fixedMember.name)) fixedNames.push(fixedMember.name);
-      // Người vãng lai nhận pass: bỏ khỏi danh sách phải trả tiền (miễn phí)
       if (casualMember) {
         casualNames = casualNames.filter(n => n !== casualMember.name);
         if (!freeNames.includes(casualMember.name)) freeNames.push(casualMember.name);
       }
     });
 
+    // --- Chế độ áp mức cố định (flat rate) ---
+    const fr = s.flatRate || {};
+    if (fr.enabled) {
+      const fixedShare = fr.fixed || 0;
+      const casualShare = fr.casual || 0;
+      const total = fixedNames.length * fixedShare + casualNames.length * casualShare;
+      return {
+        mode: 'flat',
+        total, fixedNames, casualNames, freeNames,
+        fixedShare, casualShare, multiplier: fixedShare > 0 ? (casualShare / fixedShare) : null,
+        passedFromNames: Object.keys(passes).map(fid => state.members.find(x => x.id === fid)?.name).filter(Boolean),
+        passedToNames: freeNames
+      };
+    }
+
+    // --- Chế độ chia chi phí (mặc định) ---
+    const costs = s.costs || { court: 0, water: 0, shuttle: 0, other: 0 };
+    const total = (costs.court||0) + (costs.water||0) + (costs.shuttle||0) + (costs.other||0);
     const m = state.settings.casualMultiplier || 1.5;
     const denom = fixedNames.length + m * casualNames.length;
     const unit = denom > 0 ? total / denom : 0;
-    return { total, fixedNames, casualNames, fixedShare: unit, casualShare: unit * m, multiplier: m, freeNames };
+    return {
+      mode: 'split',
+      total, fixedNames, casualNames, freeNames,
+      fixedShare: unit, casualShare: unit * m, multiplier: m,
+      passedFromNames: Object.keys(passes).map(fid => state.members.find(x => x.id === fid)?.name).filter(Boolean),
+      passedToNames: freeNames
+    };
   }
 
   // ---------- RENDER ROOT ----------
@@ -1136,7 +1155,7 @@
           const courtId = document.getElementById('ss-court').value;
           const max = parseInt(document.getElementById('ss-max').value, 10) || null;
           const note = document.getElementById('ss-note').value.trim();
-          state.sessions.push({ id: uid(), date, time, timeEnd, courtId, max, note, votes: {}, costs: { court: 0, water: 0, shuttle: 0, other: 0 } });
+          state.sessions.push({ id: uid(), date, time, timeEnd, courtId, max, note, votes: {}, costs: { court: 0, water: 0, shuttle: 0, other: 0 }, flatRate: { enabled: false, fixed: 0, casual: 0 } });
           saveSessions(); render();
         };
       }, 0);
@@ -1360,19 +1379,69 @@
     }
 
     const costBox = card.querySelector(`#cost-${s.id}`);
-    costBox.appendChild(el(`<div style="font-size:13px; font-weight:500; color:#1B4332; margin-bottom:6px;">Chi phí buổi này</div>`));
+    s.costs = s.costs || { court: 0, water: 0, shuttle: 0, other: 0 };
+    s.flatRate = s.flatRate || { enabled: false, fixed: 0, casual: 0 };
     s.penalties = s.penalties || {};
-    if (canManage()) {
-      const costForm = el(`<div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(120px,1fr)); gap:8px; margin-bottom:8px;">
-        <div><label style="font-size:12px; color:#8a877d;">Tiền sân</label><input class="bc-input" type="number" min="0" id="cost-court-${s.id}" value="${s.costs.court}" /></div>
-        <div><label style="font-size:12px; color:#8a877d;">Tiền nước</label><input class="bc-input" type="number" min="0" id="cost-water-${s.id}" value="${s.costs.water}" /></div>
-        <div><label style="font-size:12px; color:#8a877d;">Tiền cầu</label><input class="bc-input" type="number" min="0" id="cost-shuttle-${s.id}" value="${s.costs.shuttle}" /></div>
-        <div><label style="font-size:12px; color:#8a877d;">Phát sinh khác</label><input class="bc-input" type="number" min="0" id="cost-other-${s.id}" value="${s.costs.other}" /></div>
-      </div>`);
-      costBox.appendChild(costForm);
-      costBox.appendChild(el(`<button class="bc-btn outline small" id="cost-save-${s.id}" style="margin-bottom:10px;">Lưu chi phí</button>`));
 
-      // Phạt đi trễ
+    // --- Tiêu đề + nút chuyển chế độ (R1/Admin) ---
+    const costModeBar = el(`<div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+      <span style="font-size:13px; font-weight:500; color:#1B4332;">Chi phí buổi này</span>
+      ${canManage() ? `<div style="display:flex; gap:6px;">
+        <button class="bc-btn ${!s.flatRate.enabled?'':'outline'} small" id="mode-split-${s.id}">Chia chi phí</button>
+        <button class="bc-btn ${s.flatRate.enabled?'':'outline'} small" id="mode-flat-${s.id}">Áp mức cố định</button>
+      </div>` : `<span class="bc-badge" style="background:#E6F1FB; color:#0C447C;">${s.flatRate.enabled ? 'Áp mức cố định' : 'Chia chi phí'}</span>`}
+    </div>`);
+    costBox.appendChild(costModeBar);
+
+    if (canManage()) setTimeout(() => {
+      const btnSplit = document.getElementById(`mode-split-${s.id}`);
+      const btnFlat = document.getElementById(`mode-flat-${s.id}`);
+      if (btnSplit) btnSplit.onclick = () => { s.flatRate.enabled = false; saveSessions(); render(); };
+      if (btnFlat) btnFlat.onclick = () => { s.flatRate.enabled = true; saveSessions(); render(); };
+    }, 0);
+
+    if (canManage()) {
+      if (s.flatRate.enabled) {
+        // --- Form áp mức cố định ---
+        const flatForm = el(`<div style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end; margin-bottom:10px; padding:10px; background:#F4F1EA; border-radius:8px;">
+          <div><label style="font-size:12px; color:#8a877d; display:block; margin-bottom:4px;">Mức phí · Thành viên cố định</label>
+            <input class="bc-input" type="number" min="0" id="flat-fixed-${s.id}" value="${s.flatRate.fixed||0}" style="width:130px;" /></div>
+          <div><label style="font-size:12px; color:#8a877d; display:block; margin-bottom:4px;">Mức phí · Thành viên vãng lai</label>
+            <input class="bc-input" type="number" min="0" id="flat-casual-${s.id}" value="${s.flatRate.casual||0}" style="width:130px;" /></div>
+          <button class="bc-btn small" id="flat-save-${s.id}" style="align-self:flex-end;">Lưu mức phí</button>
+        </div>`);
+        costBox.appendChild(flatForm);
+        setTimeout(() => {
+          document.getElementById(`flat-save-${s.id}`).onclick = () => {
+            s.flatRate.fixed = parseFloat(document.getElementById(`flat-fixed-${s.id}`).value) || 0;
+            s.flatRate.casual = parseFloat(document.getElementById(`flat-casual-${s.id}`).value) || 0;
+            saveSessions(); render();
+          };
+        }, 0);
+      } else {
+        // --- Form chia chi phí ---
+        const costForm = el(`<div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(120px,1fr)); gap:8px; margin-bottom:8px;">
+          <div><label style="font-size:12px; color:#8a877d;">Tiền sân</label><input class="bc-input" type="number" min="0" id="cost-court-${s.id}" value="${s.costs.court}" /></div>
+          <div><label style="font-size:12px; color:#8a877d;">Tiền nước</label><input class="bc-input" type="number" min="0" id="cost-water-${s.id}" value="${s.costs.water}" /></div>
+          <div><label style="font-size:12px; color:#8a877d;">Tiền cầu</label><input class="bc-input" type="number" min="0" id="cost-shuttle-${s.id}" value="${s.costs.shuttle}" /></div>
+          <div><label style="font-size:12px; color:#8a877d;">Phát sinh khác</label><input class="bc-input" type="number" min="0" id="cost-other-${s.id}" value="${s.costs.other}" /></div>
+        </div>`);
+        costBox.appendChild(costForm);
+        costBox.appendChild(el(`<button class="bc-btn outline small" id="cost-save-${s.id}" style="margin-bottom:10px;">Lưu chi phí</button>`));
+        setTimeout(() => {
+          document.getElementById(`cost-save-${s.id}`).onclick = () => {
+            s.costs = {
+              court: parseFloat(document.getElementById(`cost-court-${s.id}`).value) || 0,
+              water: parseFloat(document.getElementById(`cost-water-${s.id}`).value) || 0,
+              shuttle: parseFloat(document.getElementById(`cost-shuttle-${s.id}`).value) || 0,
+              other: parseFloat(document.getElementById(`cost-other-${s.id}`).value) || 0
+            };
+            saveSessions(); render();
+          };
+        }, 0);
+      }
+
+      // --- Phạt đi trễ (chung cho cả 2 chế độ) ---
       const penaltySection = el(`<div style="margin-top:6px; border-top:1px dashed #E3E0D6; padding-top:8px;">
         <div style="font-size:13px; font-weight:500; color:#854F0B; margin-bottom:6px;">Phạt đi trễ</div>
         <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:6px;">
@@ -1386,8 +1455,6 @@
         <div id="pen-list-${s.id}"></div>
       </div>`);
       costBox.appendChild(penaltySection);
-
-      // Render danh sách phạt
       const penList = penaltySection.querySelector(`#pen-list-${s.id}`);
       Object.entries(s.penalties).forEach(([mid, penAmt]) => {
         if (!penAmt) return;
@@ -1403,25 +1470,53 @@
         row.querySelector('button').onclick = () => { delete s.penalties[mid]; saveSessions(); render(); };
         penList.appendChild(row);
       });
+      setTimeout(() => {
+        const penAddBtn = document.getElementById(`pen-add-${s.id}`);
+        if (penAddBtn) penAddBtn.onclick = () => {
+          const mid = document.getElementById(`pen-member-${s.id}`).value;
+          const amt = parseFloat(document.getElementById(`pen-amount-${s.id}`).value) || 0;
+          if (!mid || !amt) return;
+          s.penalties[mid] = (s.penalties[mid] || 0) + amt;
+          saveSessions(); render();
+        };
+      }, 0);
     }
 
-    // Tổng phạt cho mỗi người
+    // --- Tổng phạt ---
     const penaltyMap = {};
     Object.entries(s.penalties||{}).forEach(([mid, amt]) => { penaltyMap[mid] = amt || 0; });
 
-    if (shares.total > 0) {
-      costBox.appendChild(el(`<div style="margin-top:10px; font-size:13px; color:#6b7a73;">
-        Tổng chi phí chia đều: <strong style="color:#1B4332; font-weight:500;">${formatVND(shares.total)}</strong>
-        · Cố định: <strong style="color:#1B4332; font-weight:500;">${formatVND(shares.fixedShare)}</strong>
-        · Vãng lai (×${shares.multiplier}): <strong style="color:#1B4332; font-weight:500;">${formatVND(shares.casualShare)}</strong>
-      </div>`));
-      const allPayers = [...shares.fixedNames.map(n => ({ name: n, type: 'fixed', base: shares.fixedShare })),
-                         ...shares.casualNames.map(n => ({ name: n, type: 'casual', base: shares.casualShare })),
-                         ...shares.freeNames.map(n => ({ name: n, type: 'free', base: 0 }))];
+    // --- Bảng chi tiết chi phí (chung cho cả 2 chế độ) ---
+    const hasData = shares.mode === 'flat' ? (shares.fixedShare > 0 || shares.casualShare > 0) : shares.total > 0;
+    if (hasData || shares.fixedNames.length || shares.casualNames.length) {
+      if (shares.mode === 'flat') {
+        costBox.appendChild(el(`<div style="margin-top:10px; font-size:13px; color:#6b7a73;">
+          Mức áp: Cố định <strong style="color:#1B4332;">${formatVND(shares.fixedShare)}</strong>
+          · Vãng lai <strong style="color:#1B4332;">${formatVND(shares.casualShare)}</strong>
+          · Tổng thu: <strong style="color:#1B4332;">${formatVND(shares.total)}</strong>
+        </div>`));
+      } else if (shares.total > 0) {
+        costBox.appendChild(el(`<div style="margin-top:10px; font-size:13px; color:#6b7a73;">
+          Tổng chia: <strong style="color:#1B4332;">${formatVND(shares.total)}</strong>
+          · Cố định: <strong style="color:#1B4332;">${formatVND(shares.fixedShare)}</strong>
+          · Vãng lai (×${shares.multiplier}): <strong style="color:#1B4332;">${formatVND(shares.casualShare)}</strong>
+        </div>`));
+      }
+
+      const allPayers = [
+        ...shares.fixedNames.map(n => ({ name: n, type: 'fixed', base: shares.fixedShare })),
+        ...shares.casualNames.map(n => ({ name: n, type: 'casual', base: shares.casualShare })),
+        ...shares.freeNames.map(n => ({ name: n, type: 'free', base: 0 }))
+      ];
       if (allPayers.length) {
         const detail = el(`<table style="width:100%; font-size:13px; border-collapse:collapse; margin-top:8px;"></table>`);
-        const hdr = el(`<tr style="color:#8a877d; font-size:12px;"><th style="padding:4px; text-align:left;">Thành viên</th><th style="padding:4px; text-align:left;">Loại</th><th style="padding:4px; text-align:right;">Chi phí</th><th style="padding:4px; text-align:right;">Phạt trễ</th><th style="padding:4px; text-align:right;">Tổng phải trả</th></tr>`);
-        detail.appendChild(hdr);
+        detail.appendChild(el(`<tr style="color:#8a877d; font-size:12px;">
+          <th style="padding:4px; text-align:left;">Thành viên</th>
+          <th style="padding:4px; text-align:left;">Loại</th>
+          <th style="padding:4px; text-align:right;">Chi phí</th>
+          <th style="padding:4px; text-align:right;">Phạt trễ</th>
+          <th style="padding:4px; text-align:right;">Tổng phải trả</th>
+        </tr>`));
         allPayers.forEach(p => {
           const mem = state.members.find(x => x.name === p.name);
           const pen = mem ? (penaltyMap[mem.id] || 0) : 0;
@@ -1434,44 +1529,14 @@
             <td style="padding:5px 4px; text-align:right; font-weight:600; color:#1B4332;">${formatVND(p.base + pen)}</td>
           </tr>`));
         });
-        // Người cố định đã pass
-        shares.passedFromNames && shares.passedFromNames.forEach(name => {
-          const pen = state.members.find(x => x.name === name);
-          const penAmt = pen ? (penaltyMap[pen.id] || 0) : 0;
-          detail.appendChild(el(`<tr style="border-top:1px solid #F1EFE8; opacity:.7;">
-            <td style="padding:5px 4px;">${escapeHtml(name)}</td>
-            <td style="padding:5px 4px; color:#8a877d;">Cố định (đã pass)</td>
-            <td style="padding:5px 4px; text-align:right;">${formatVND(shares.fixedShare)}</td>
-            <td style="padding:5px 4px; text-align:right; color:#854F0B;">${penAmt ? formatVND(penAmt) : '—'}</td>
-            <td style="padding:5px 4px; text-align:right; font-weight:600; color:#1B4332;">${formatVND(shares.fixedShare + penAmt)}</td>
-          </tr>`));
-        });
         costBox.appendChild(detail);
       }
     } else if (canManage()) {
-      costBox.appendChild(el(`<div style="font-size:13px; color:#8a877d; margin-top:8px;">Nhập chi phí và lưu để tính tiền chia cho từng người đã tham gia.</div>`));
+      const hint = s.flatRate.enabled
+        ? `<div style="font-size:13px; color:#8a877d; margin-top:8px;">Nhập mức phí cố định và vãng lai rồi lưu để xem bảng chi tiết.</div>`
+        : `<div style="font-size:13px; color:#8a877d; margin-top:8px;">Nhập chi phí và lưu để tính tiền chia cho từng người đã tham gia.</div>`;
+      costBox.appendChild(el(hint));
     }
-
-    if (canManage()) setTimeout(() => {
-      document.getElementById(`cost-save-${s.id}`).onclick = () => {
-        s.costs = {
-          court: parseFloat(document.getElementById(`cost-court-${s.id}`).value) || 0,
-          water: parseFloat(document.getElementById(`cost-water-${s.id}`).value) || 0,
-          shuttle: parseFloat(document.getElementById(`cost-shuttle-${s.id}`).value) || 0,
-          other: parseFloat(document.getElementById(`cost-other-${s.id}`).value) || 0
-        };
-        saveSessions(); render();
-      };
-      const penAddBtn = document.getElementById(`pen-add-${s.id}`);
-      if (penAddBtn) penAddBtn.onclick = () => {
-        const mid = document.getElementById(`pen-member-${s.id}`).value;
-        const amt = parseFloat(document.getElementById(`pen-amount-${s.id}`).value) || 0;
-        if (!mid || !amt) return;
-        s.penalties = s.penalties || {};
-        s.penalties[mid] = (s.penalties[mid] || 0) + amt;
-        saveSessions(); render();
-      };
-    }, 0);
 
     if (canDelete()) {
       const delBtn = card.querySelector(`#del-${s.id}`);
