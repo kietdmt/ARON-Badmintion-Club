@@ -482,9 +482,10 @@
     </div>`);
     wrap.appendChild(filterBar);
 
-    // Search thanh viên theo tên
-    const searchBar = el(`<div style="display:flex; gap:8px; align-items:center; margin-bottom:0.75rem;">
-      <input class="bc-input" id="mb-search" placeholder="🔍  Tìm theo tên thành viên..." value="${escapeHtml(state.memberSearch)}" style="max-width:320px;" />
+    // Search thành viên theo tên — dùng nút bấm thay vì live search
+    const searchBar = el(`<div style="display:flex; gap:8px; align-items:center; margin-bottom:0.75rem; flex-wrap:wrap;">
+      <input class="bc-input" id="mb-search" placeholder="Nhập tên hoặc username..." value="${escapeHtml(state.memberSearch)}" style="max-width:280px;" />
+      <button class="bc-btn small" id="mb-search-btn">🔍 Tìm</button>
       ${state.memberSearch ? `<button class="bc-btn outline small" id="mb-search-clear">✕ Xoá</button>` : ''}
     </div>`);
     wrap.appendChild(searchBar);
@@ -526,7 +527,10 @@
       document.getElementById('mb-view-month').onchange = (e) => { state.viewMonth = e.target.value || monthKey(); render(); };
       filterBar.querySelectorAll('[data-filter]').forEach(n => n.onclick = () => { state.memberFilter = n.dataset.filter; state.memberVisibleCount = 0; render(); });
       const mbSearch = document.getElementById('mb-search');
-      if (mbSearch) mbSearch.oninput = (e) => { state.memberSearch = e.target.value; state.memberVisibleCount = 0; render(); };
+      const mbSearchBtn = document.getElementById('mb-search-btn');
+      const doSearch = () => { state.memberSearch = document.getElementById('mb-search').value; state.memberVisibleCount = 0; render(); };
+      if (mbSearchBtn) mbSearchBtn.onclick = doSearch;
+      if (mbSearch) mbSearch.onkeydown = (e) => { if (e.key === 'Enter') doSearch(); };
       const mbClear = document.getElementById('mb-search-clear');
       if (mbClear) mbClear.onclick = () => { state.memberSearch = ''; state.memberVisibleCount = 0; render(); };
     }, 0);
@@ -1149,13 +1153,20 @@
         <option value="">Tất cả sân</option>
         ${state.courts.map(c => `<option value="${c.id}" ${state.sessionSearchCourt===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('')}
       </select>
+      <button class="bc-btn small" id="search-btn">🔍 Tìm</button>
       ${(state.sessionSearchDate || state.sessionSearchCourt) ? `<button class="bc-btn outline small" id="search-clear">✕ Xoá lọc</button>` : ''}
       <span style="font-size:12px; color:#8a877d; margin-left:auto;">${all.length} buổi tổng cộng</span>
     </div>`);
     wrap.appendChild(searchCard);
     setTimeout(() => {
-      document.getElementById('search-month').onchange = (e) => { state.sessionSearchDate = e.target.value; state.upcomingPage = 0; render(); };
-      document.getElementById('search-court').onchange = (e) => { state.sessionSearchCourt = e.target.value; state.upcomingPage = 0; render(); };
+      document.getElementById('search-btn').onclick = () => {
+        state.sessionSearchDate = document.getElementById('search-month').value;
+        state.sessionSearchCourt = document.getElementById('search-court').value;
+        state.upcomingPage = 0;
+        render();
+      };
+      // Cho phép nhấn Enter trong ô tháng để tìm luôn
+      document.getElementById('search-month').onkeydown = (e) => { if (e.key === 'Enter') document.getElementById('search-btn').click(); };
       const clearBtn = document.getElementById('search-clear');
       if (clearBtn) clearBtn.onclick = () => { state.sessionSearchDate = ''; state.sessionSearchCourt = ''; state.upcomingPage = 0; render(); };
     }, 0);
@@ -1283,10 +1294,16 @@
       const lockedForOthers = s.locked && role() === 'r2';
 
       const tbl = el(`<table style="width:100%; font-size:13px; border-collapse:collapse;"></table>`);
+      let hiddenCount = 0;
       state.members.forEach(m => {
         const v = s.votes[m.name];
         const t = memberType(m.name, mKey);
         const hasPassed = t === 'fixed' && passes[m.id];
+        const notVoted = !v;
+
+        // Khi buổi đã chốt: ẩn thành viên chưa vote
+        if (s.locked && notVoted && !hasPassed) { hiddenCount++; return; }
+
         const statusBadge = hasPassed
           ? `<span class="bc-badge" style="background:#FAEEDA; color:#854F0B;">Đã pass (tính vắng)</span>`
           : v === 'yes'
@@ -1325,6 +1342,9 @@
         </tr>`));
       });
       voteTable.appendChild(tbl);
+      if (s.locked && hiddenCount > 0) {
+        voteTable.appendChild(el(`<div style="font-size:12px; color:#8a877d; margin-top:6px; font-style:italic;">🔒 Đã ẩn ${hiddenCount} thành viên chưa vote (buổi đã chốt). Mở chốt để hiển thị lại.</div>`));
+      }
 
       setTimeout(() => {
         state.members.forEach(m => {
@@ -1465,13 +1485,21 @@
     return card;
   }
 
-  // ---------- LÀM MỚI DỮ LIỆU (tránh hiển thị vote/dữ liệu cũ khi nhiều người cùng dùng) ----------
+  // ---------- LÀM MỚI DỮ LIỆU ----------
   let refreshing = false;
+  let pendingRefreshTimer = null;
+
   async function refreshAll(){
     if (!state.me || refreshing) return;
-    // Không làm mới khi người dùng đang gõ trong một ô input/textarea/select, để tránh mất dữ liệu đang nhập
     const ae = document.activeElement;
-    if (ae && /INPUT|TEXTAREA|SELECT/.test(ae.tagName)) return;
+    if (ae && /INPUT|TEXTAREA|SELECT/.test(ae.tagName)) {
+      // Đang nhập — hủy timer cũ rồi đặt delay 5 giây sau khi blur
+      clearTimeout(pendingRefreshTimer);
+      const deferRefresh = () => { clearTimeout(pendingRefreshTimer); pendingRefreshTimer = setTimeout(refreshAll, 5000); };
+      ae.removeEventListener('blur', deferRefresh);
+      ae.addEventListener('blur', deferRefresh, { once: true });
+      return;
+    }
     refreshing = true;
     try {
       const [members, courts, sessions, settingsRaw, payments, fund, donations] = await Promise.all([
