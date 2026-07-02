@@ -60,7 +60,8 @@
     me: null, myUsername: null, tab: 'sessions', memberFilter: 'all', viewMonth: monthKey(),
     authMode: 'login', authError: '', remember: false,
     sessionSearchDate: '', sessionSearchCourt: '', pastVisibleCount: 3,
-    memberSearch: '', memberVisibleCount: 15
+    memberSearch: '', memberVisibleCount: 15,
+    lastUpdated: {}
   };
 
   // ---------- Quyền ----------
@@ -84,9 +85,11 @@
     const json = JSON.stringify(val);
     if (json.length > 4500000) { showSaveError(key + ' (dữ liệu quá lớn, ảnh logo/banner nên dưới ~1MB)'); return false; }
     try {
-      const { error } = await sb.from('bc_data').upsert({ key, value: val });
+      const nowStr = new Date().toISOString();
+      const { error } = await sb.from('bc_data').upsert({ key, value: val, updated_at: nowStr });
       if (error) throw error;
       state.saveError = null;
+      state.lastUpdated[key] = nowStr;
       return true;
     } catch(e) {
       console.error('Lưu thất bại', key, e);
@@ -100,9 +103,13 @@
   }
   async function loadKey(key, fallback){
     try {
-      const { data, error } = await sb.from('bc_data').select('value').eq('key', key).maybeSingle();
+      const { data, error } = await sb.from('bc_data').select('value, updated_at').eq('key', key).maybeSingle();
       if (error) throw error;
-      return data ? data.value : fallback;
+      if (data) {
+        state.lastUpdated[key] = data.updated_at;
+        return data.value;
+      }
+      return fallback;
     } catch(e) { console.error('Đọc thất bại', key, e); return fallback; }
   }
   const saveMembers = () => save('bc_members', state.members);
@@ -113,60 +120,96 @@
   const saveFund = () => save('bc_fund', state.fund);
   const saveDonations = () => save('bc_donations', state.donations);
 
-  // Luôn lấy bản mới nhất từ database trước khi sửa danh sách thành viên,
-  // để tránh 2 người sửa/đăng ký cùng lúc ghi đè làm mất dữ liệu của nhau.
-  // mutator(latestList) trả về list mới để lưu, hoặc null để hủy (ví dụ validate lỗi).
-  let paymentsMutating = false;
-  async function mutatePayments(mutator){
-    while (paymentsMutating) { await new Promise(r => setTimeout(r, 150)); }
-    paymentsMutating = true;
-    try {
-      const latest = await loadKey('bc_payments', state.payments || {});
-      const updated = mutator(latest);
-      if (updated === null) return false;
-      state.payments = updated;
-      return await save('bc_payments', updated);
-    } finally { paymentsMutating = false; }
-  }
-  let fundMutating = false;
-  async function mutateFund(mutator){
-    while (fundMutating) { await new Promise(r => setTimeout(r, 150)); }
-    fundMutating = true;
-    try {
-      const latest = await loadKey('bc_fund', state.fund || {});
-      const updated = mutator(latest);
-      if (updated === null) return false;
-      state.fund = updated;
-      return await save('bc_fund', updated);
-    } finally { fundMutating = false; }
-  }
-  let donationsMutating = false;
-  async function mutateDonations(mutator){
-    while (donationsMutating) { await new Promise(r => setTimeout(r, 150)); }
-    donationsMutating = true;
-    try {
-      const latest = await loadKey('bc_donations', state.donations || []);
-      const updated = mutator(latest);
-      if (updated === null) return false;
-      state.donations = updated;
-      return await save('bc_donations', updated);
-    } finally { donationsMutating = false; }
-  }
-  let membersMutating = false;
-  async function mutateMembers(mutator){
-    while (membersMutating) { await new Promise(r => setTimeout(r, 150)); }
-    membersMutating = true;
-    try {
-      const latest = await loadKey('bc_members', state.members || []);
-      const updated = mutator(latest);
-      if (updated === null) return false;
-      state.members = updated;
-      resolveMe();
-      const ok = await save('bc_members', updated);
-      return ok;
-    } finally {
-      membersMutating = false;
+  // Helper cho ghi dữ liệu có kiểm tra xung đột đồng thời (Optimistic Concurrency Control)
+  async function mutateKey(key, mutator, fallbackVal) {
+    const maxRetries = 3;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const { data, error } = await sb.from('bc_data')
+          .select('value, updated_at')
+          .eq('key', key)
+          .maybeSingle();
+        
+        if (error) throw error;
+        
+        const latestVal = data ? data.value : fallbackVal;
+        const lastKnownUpdated = data ? data.updated_at : null;
+        
+        const updatedVal = mutator(latestVal);
+        if (updatedVal === null) return null;
+        
+        const nowStr = new Date().toISOString();
+        let success = false;
+        
+        if (!data) {
+          const { data: insertData, error: insertError } = await sb.from('bc_data')
+            .insert({ key, value: updatedVal, updated_at: nowStr })
+            .select();
+          if (insertError) throw insertError;
+          if (insertData && insertData.length > 0) {
+            success = true;
+          }
+        } else {
+          let query = sb.from('bc_data')
+            .update({ value: updatedVal, updated_at: nowStr })
+            .eq('key', key);
+          
+          if (lastKnownUpdated) {
+            query = query.eq('updated_at', lastKnownUpdated);
+          } else {
+            query = query.is('updated_at', null);
+          }
+          
+          const { data: updateData, error: updateError } = await query.select();
+          if (updateError) throw updateError;
+          if (updateData && updateData.length > 0) {
+            success = true;
+          }
+        }
+        
+        if (success) {
+          state.lastUpdated[key] = nowStr;
+          return updatedVal;
+        } else {
+          console.warn(`Xung đột đồng thời khi ghi key "${key}". Thử lại lần ${attempt}...`);
+          await new Promise(r => setTimeout(r, 100 + Math.random() * 150));
+        }
+      } catch (e) {
+        console.error(`Lỗi mutate key "${key}" lần thử ${attempt}:`, e);
+        if (attempt === maxRetries) {
+          showSaveError(key);
+          return null;
+        }
+        await new Promise(r => setTimeout(r, 200 * attempt));
+      }
     }
+    return null;
+  }
+
+  async function mutatePayments(mutator){
+    const updated = await mutateKey('bc_payments', mutator, {});
+    if (updated === null) return false;
+    state.payments = updated;
+    return true;
+  }
+  async function mutateFund(mutator){
+    const updated = await mutateKey('bc_fund', mutator, {});
+    if (updated === null) return false;
+    state.fund = updated;
+    return true;
+  }
+  async function mutateDonations(mutator){
+    const updated = await mutateKey('bc_donations', mutator, []);
+    if (updated === null) return false;
+    state.donations = updated;
+    return true;
+  }
+  async function mutateMembers(mutator){
+    const updated = await mutateKey('bc_members', mutator, []);
+    if (updated === null) return false;
+    state.members = updated;
+    resolveMe();
+    return true;
   }
 
   // Dữ liệu riêng từng máy (đăng nhập, nhớ mật khẩu) lưu bằng localStorage của trình duyệt
@@ -176,13 +219,35 @@
   const saveRemember = (data) => lsSet('bc_remember', data);
 
   async function loadAll(){
-    state.members = await loadKey('bc_members', []);
-    state.courts = await loadKey('bc_courts', []);
-    state.sessions = await loadKey('bc_sessions', []);
-    state.settings = Object.assign({ casualMultiplier: 1.5, logoUrl: '', bannerUrl: '' }, await loadKey('bc_settings', {}));
-    state.payments = await loadKey('bc_payments', {});
-    state.fund = await loadKey('bc_fund', {});
-    state.donations = await loadKey('bc_donations', []);
+    try {
+      const { data, error } = await sb.from('bc_data').select('key, value, updated_at');
+      if (error) throw error;
+      
+      const dbMap = {};
+      if (data) {
+        data.forEach(row => {
+          dbMap[row.key] = row.value;
+          state.lastUpdated[row.key] = row.updated_at;
+        });
+      }
+      
+      state.members = dbMap['bc_members'] || [];
+      state.courts = dbMap['bc_courts'] || [];
+      state.sessions = dbMap['bc_sessions'] || [];
+      state.settings = Object.assign({ casualMultiplier: 1.5, logoUrl: '', bannerUrl: '' }, dbMap['bc_settings'] || {});
+      state.payments = dbMap['bc_payments'] || {};
+      state.fund = dbMap['bc_fund'] || {};
+      state.donations = dbMap['bc_donations'] || [];
+    } catch (e) {
+      console.error('loadAll thất bại, chuyển sang load tuần tự', e);
+      state.members = await loadKey('bc_members', []);
+      state.courts = await loadKey('bc_courts', []);
+      state.sessions = await loadKey('bc_sessions', []);
+      state.settings = Object.assign({ casualMultiplier: 1.5, logoUrl: '', bannerUrl: '' }, await loadKey('bc_settings', {}));
+      state.payments = await loadKey('bc_payments', {});
+      state.fund = await loadKey('bc_fund', {});
+      state.donations = await loadKey('bc_donations', []);
+    }
     state.myUsername = lsGet('bc_my_username');
     state.rememberData = lsGet('bc_remember');
     if (!state.myUsername && state.rememberData && state.rememberData.username) {
@@ -1567,24 +1632,52 @@
     }
     refreshing = true;
     try {
-      const [members, courts, sessions, settingsRaw, payments, fund, donations] = await Promise.all([
-        loadKey('bc_members', state.members),
-        loadKey('bc_courts', state.courts),
-        loadKey('bc_sessions', state.sessions),
-        loadKey('bc_settings', {}),
-        loadKey('bc_payments', state.payments),
-        loadKey('bc_fund', state.fund),
-        loadKey('bc_donations', state.donations),
-      ]);
-      state.members = members;
-      state.courts = courts;
-      state.sessions = sessions;
-      state.settings = Object.assign({ casualMultiplier: 1.5, logoUrl: '', bannerUrl: '' }, settingsRaw);
-      state.payments = payments;
-      state.fund = fund;
-      state.donations = donations;
-      resolveMe();
-      render();
+      // 1. Chỉ lấy key và updated_at để kiểm tra xem có thay đổi hay không
+      const { data: dbKeys, error: keyError } = await sb.from('bc_data').select('key, updated_at');
+      if (keyError) throw keyError;
+      
+      const modifiedKeys = [];
+      const currentTimestamps = {};
+      if (dbKeys) {
+        dbKeys.forEach(row => {
+          currentTimestamps[row.key] = row.updated_at;
+          if (row.updated_at !== state.lastUpdated[row.key]) {
+            modifiedKeys.push(row.key);
+          }
+        });
+      }
+      
+      // 2. Chỉ tải các key thực sự đã thay đổi
+      if (modifiedKeys.length > 0) {
+        const { data: updatedData, error: valError } = await sb.from('bc_data')
+          .select('key, value, updated_at')
+          .in('key', modifiedKeys);
+        if (valError) throw valError;
+        
+        const dbMap = {};
+        if (updatedData) {
+          updatedData.forEach(row => {
+            dbMap[row.key] = row.value;
+            state.lastUpdated[row.key] = row.updated_at;
+          });
+        }
+        
+        if (modifiedKeys.includes('bc_members')) state.members = dbMap['bc_members'] || [];
+        if (modifiedKeys.includes('bc_courts')) state.courts = dbMap['bc_courts'] || [];
+        if (modifiedKeys.includes('bc_sessions')) state.sessions = dbMap['bc_sessions'] || [];
+        if (modifiedKeys.includes('bc_settings')) {
+          state.settings = Object.assign({ casualMultiplier: 1.5, logoUrl: '', bannerUrl: '' }, dbMap['bc_settings'] || {});
+        }
+        if (modifiedKeys.includes('bc_payments')) state.payments = dbMap['bc_payments'] || {};
+        if (modifiedKeys.includes('bc_fund')) state.fund = dbMap['bc_fund'] || {};
+        if (modifiedKeys.includes('bc_donations')) state.donations = dbMap['bc_donations'] || [];
+        
+        resolveMe();
+        render();
+      } else {
+        // Cập nhật lại cache timestamp nếu cần
+        Object.assign(state.lastUpdated, currentTimestamps);
+      }
     } catch(e) {
       console.error('Làm mới thất bại', e);
     } finally {
@@ -1594,8 +1687,26 @@
   let autoRefreshTimer = null;
   function startAutoRefresh(){
     if (autoRefreshTimer) return;
-    autoRefreshTimer = setInterval(refreshAll, 10000);
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshAll(); });
+    
+    const refreshIfVisible = () => {
+      if (!document.hidden) refreshAll();
+    };
+    
+    autoRefreshTimer = setInterval(refreshIfVisible, 10000);
+    
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        if (autoRefreshTimer) {
+          clearInterval(autoRefreshTimer);
+          autoRefreshTimer = null;
+        }
+      } else {
+        refreshAll();
+        if (!autoRefreshTimer) {
+          autoRefreshTimer = setInterval(refreshIfVisible, 10000);
+        }
+      }
+    });
     window.addEventListener('focus', () => refreshAll());
   }
 
