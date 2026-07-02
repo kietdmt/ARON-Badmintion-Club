@@ -321,7 +321,11 @@
 
   function computeShares(s){
     const mKey = sessionMonthKey(s);
-    const activeNames = state.members.map(m => m.name);
+    const activeMembers = state.members.filter(m => {
+      const curType = (m.monthlyType || {})[mKey] || '';
+      return curType === 'fixed' || curType === 'casual';
+    });
+    const activeNames = activeMembers.map(m => m.name);
     const yesNames = Object.entries(s.votes)
       .filter(([,v]) => v === 'yes')
       .map(([name]) => name)
@@ -1428,6 +1432,7 @@
   }
 
   function renderSessionCard(s){
+    const mKey = sessionMonthKey(s);
     const court = state.courts.find(c => c.id === s.courtId);
     const yes = Object.entries(s.votes).filter(([,v]) => v === 'yes').map(([name]) => name);
     const no = Object.entries(s.votes).filter(([,v]) => v === 'no').map(([name]) => name);
@@ -1470,12 +1475,17 @@
     } else if (lockedForMe) {
       voteRow.appendChild(el(`<div style="font-size:13px; color:#854F0B;">🔒 Buổi đã được chốt, không thể thay đổi vote. Liên hệ Admin/R1 nếu cần sửa.</div>`));
     } else {
-      const myVote = s.votes[state.me.name];
-      const yesBtn = el(`<button class="bc-btn small ${myVote==='yes'?'':'outline'}">Tham gia</button>`);
-      const noBtn = el(`<button class="bc-btn small ${myVote==='no'?'':'outline'}">Không tham gia</button>`);
-      yesBtn.onclick = () => { s.votes[state.me.name] = 'yes'; saveSessions(); render(); };
-      noBtn.onclick = () => { s.votes[state.me.name] = 'no'; saveSessions(); render(); };
-      voteRow.appendChild(yesBtn); voteRow.appendChild(noBtn);
+      const myType = (state.me.monthlyType || {})[mKey] || '';
+      if (myType !== 'fixed' && myType !== 'casual') {
+        voteRow.appendChild(el(`<div style="font-size:13px; color:#8a877d;">Bạn chưa đăng ký hoạt động tháng này (Cố định/Vãng lai) nên không thể vote.</div>`));
+      } else {
+        const myVote = s.votes[state.me.name];
+        const yesBtn = el(`<button class="bc-btn small ${myVote==='yes'?'':'outline'}">Tham gia</button>`);
+        const noBtn = el(`<button class="bc-btn small ${myVote==='no'?'':'outline'}">Không tham gia</button>`);
+        yesBtn.onclick = () => { s.votes[state.me.name] = 'yes'; saveSessions(); render(); };
+        noBtn.onclick = () => { s.votes[state.me.name] = 'no'; saveSessions(); render(); };
+        voteRow.appendChild(yesBtn); voteRow.appendChild(noBtn);
+      }
     }
 
     const voteTable = card.querySelector(`#vote-table-${s.id}`);
@@ -1483,15 +1493,20 @@
     if (state.members.length === 0) {
       voteTable.appendChild(el(`<div style="font-size:13px; color:#8a877d;">Chưa có thành viên nào.</div>`));
     } else {
-      const mKey = sessionMonthKey(s);
       s.passes = s.passes || {};
       const passes = s.passes;
-      const casualList = state.members.filter(x => memberType(x.name, mKey) !== 'fixed' && x.status === 'active' && s.votes[x.name] !== 'no');
+      const casualList = state.members.filter(x => {
+        const curType = (x.monthlyType || {})[mKey] || '';
+        return curType === 'casual' && x.status === 'active' && s.votes[x.name] !== 'no';
+      });
       const lockedForOthers = s.locked && role() === 'r2';
 
-      // Xây dựng danh sách hiển thị gồm thành viên hiện tại + thành viên đã xoá có lịch sử vote
+      // Xây dựng danh sách hiển thị gồm thành viên hiện tại đã đăng ký + thành viên đã xoá có lịch sử vote
       const currentNames = state.members.map(m => m.name);
-      const displayMembers = [...state.members];
+      const displayMembers = state.members.filter(m => {
+        const curType = (m.monthlyType || {})[mKey] || '';
+        return curType === 'fixed' || curType === 'casual';
+      });
       Object.keys(s.votes).forEach(name => {
         if (!currentNames.includes(name)) {
           displayMembers.push({
@@ -1512,9 +1527,10 @@
         const t = memberType(m.name, mKey);
         const hasPassed = t === 'fixed' && passes[m.id];
         const notVoted = !v;
+        const isAbsent = v === 'no';
 
-        // Khi buổi đã chốt: ẩn thành viên chưa vote
-        if (s.locked && notVoted && !hasPassed) { hiddenCount++; return; }
+        // Khi buổi đã chốt: ẩn thành viên chưa vote hoặc vắng (và không pass)
+        if (s.locked && (notVoted || isAbsent) && !hasPassed) { hiddenCount++; return; }
 
         const isReceiver = Object.values(passes).includes(m.id);
         const statusBadge = hasPassed
@@ -1570,7 +1586,7 @@
       });
       voteTable.appendChild(tbl);
       if (s.locked && hiddenCount > 0) {
-        voteTable.appendChild(el(`<div style="font-size:12px; color:#8a877d; margin-top:6px; font-style:italic;">🔒 Đã ẩn ${hiddenCount} thành viên chưa vote (buổi đã chốt). Mở chốt để hiển thị lại.</div>`));
+        voteTable.appendChild(el(`<div style="font-size:12px; color:#8a877d; margin-top:6px; font-style:italic;">🔒 Đã ẩn ${hiddenCount} thành viên chưa vote hoặc vắng (buổi đã chốt). Mở chốt để hiển thị lại.</div>`));
       }
 
       setTimeout(() => {
