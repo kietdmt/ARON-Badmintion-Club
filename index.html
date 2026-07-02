@@ -30,7 +30,9 @@
 (function(){
   const LEVELS = ["Mới chơi", "Trung bình", "Khá", "Giỏi"];
   const LEVEL_COLOR = { "Mới chơi": ["#EAF3DE","#27500A"], "Trung bình": ["#E6F1FB","#0C447C"], "Khá": ["#FAEEDA","#854F0B"], "Giỏi": ["#FAECE7","#993C1D"] };
-  const MAX_MEMBERS = 50;
+  const PROTECTED_USERNAME = 'kietdmt';
+  function isProtected(m){ return normUsername(m.username||'') === PROTECTED_USERNAME; }
+  function canResetProtected(){ return state.me && (normUsername(state.me.username||'') === PROTECTED_USERNAME || state.me.role === 'admin'); }
   const MONTH_NAMES = ["Th1","Th2","Th3","Th4","Th5","Th6","Th7","Th8","Th9","Th10","Th11","Th12"];
   const ROLE_LABEL = { admin: "Admin", r1: "R1", r2: "R2" };
   const ROLE_COLOR = { admin: ["#FAECE7","#993C1D"], r1: ["#FAEEDA","#854F0B"], r2: ["#F1EFE8","#444441"] };
@@ -195,6 +197,8 @@
   function resolveMe(){
     if (!state.myUsername) { state.me = null; return; }
     const found = state.members.find(m => normUsername(m.username) === normUsername(state.myUsername));
+    // Không cho thành viên chưa được duyệt (pending) vào app
+    if (found && found.status === 'pending') { state.me = null; return; }
     state.me = found || null;
     if (!found) state.myUsername = null;
   }
@@ -277,6 +281,7 @@
     if (state.tab === 'members') root.appendChild(renderMembers());
     if (state.tab === 'courts') root.appendChild(renderCourts());
     if (state.tab === 'fund') root.appendChild(renderFund());
+    if (state.tab === 'approve') root.appendChild(renderApprove());
   }
 
   // ---------- AUTH ----------
@@ -293,6 +298,17 @@
     head.appendChild(el(`<h1 style="font-size:20px; color:#1B4332;">Hội cầu lông</h1>`));
     head.appendChild(el(`<p style="font-size:13px; color:#8a877d; margin-top:4px;">Đăng nhập bằng email và mật khẩu để vote, đăng ký lịch và xem chi phí.</p>`));
     wrap.appendChild(head);
+
+    if (state.authMode === 'pending_notice') {
+      wrap.appendChild(el(`<div class="bc-card" style="text-align:center; padding:2rem 1rem;">
+        <div style="font-size:2.5rem; margin-bottom:12px;">⏳</div>
+        <h3 style="font-size:16px; color:#1B4332; margin-bottom:8px;">Đăng ký thành công!</h3>
+        <p style="font-size:14px; color:#6b7a73; margin-bottom:16px;">Tài khoản của bạn đang chờ <strong>Admin hoặc R1</strong> phê duyệt.<br>Sau khi được duyệt, bạn có thể đăng nhập và sử dụng app bình thường.</p>
+        <button class="bc-btn outline small" id="back-to-login">Quay lại đăng nhập</button>
+      </div>`));
+      setTimeout(() => { document.getElementById('back-to-login').onclick = () => { state.authMode = 'login'; render(); }; }, 0);
+      return wrap;
+    }
 
     const tabs = el(`<div style="display:flex; gap:6px; justify-content:center; margin-bottom:1rem;">
       <div class="bc-tab ${state.authMode==='login'?'active':''}" data-mode="login">Đăng nhập</div>
@@ -343,6 +359,7 @@
         const found = state.members.find(m => normUsername(m.username) === username);
         if (!found) { state.authError = 'Không tìm thấy tên đăng nhập này.'; render(); return; }
         if (found.password !== password) { state.authError = 'Sai mật khẩu.'; render(); return; }
+        if (found.status === 'pending') { state.authError = '⏳ Tài khoản của bạn đang chờ Admin/R1 phê duyệt. Vui lòng chờ và thử lại sau.'; render(); return; }
         state.myUsername = found.username; state.authError = ''; saveMyUsername();
         if (remember) { state.rememberData = { username: found.username, password }; saveRemember(state.rememberData); }
         else { state.rememberData = null; saveRemember(null); }
@@ -368,15 +385,23 @@
           if (latest.some(m => normEmail(m.email) === email)) { regError = 'Email này đã đăng ký, hãy chọn Đăng nhập.'; return null; }
           if (latest.length >= MAX_MEMBERS) { regError = 'Nhóm đã đạt giới hạn ' + MAX_MEMBERS + ' thành viên.'; return null; }
           const isFirst = latest.length === 0;
+          const isKiet = username === PROTECTED_USERNAME;
           const newMember = {
             id: uid(), name, username, email, phone, level, password: pw1,
-            status: 'active',
-            role: isFirst ? 'admin' : 'r2',
+            status: (isFirst || isKiet) ? 'active' : 'pending',
+            role: (isFirst || isKiet) ? 'admin' : 'r2',
             monthlyType: {}, avatarUrl: ''
           };
           return latest.concat([newMember]);
         });
         if (!ok) { state.authError = regError || 'Đăng ký thất bại, vui lòng thử lại.'; render(); return; }
+        const newMe = state.members.find(m => normUsername(m.username) === username);
+        if (newMe && newMe.status === 'pending') {
+          state.myUsername = null; saveMyUsername();
+          state.authError = '';
+          state.authMode = 'pending_notice';
+          render(); return;
+        }
         state.myUsername = username; state.authError = ''; saveMyUsername(); resolveMe(); render();
       };
     }, 0);
@@ -411,8 +436,12 @@
 
   function renderTabs(){
     const wrap = el(`<div style="display:flex; gap:6px; margin-bottom:1rem; border-bottom:1px solid #E3E0D6; padding-bottom:0.75rem;"></div>`);
-    [['sessions','Lịch đánh'],['members','Thành viên'],['courts','Sân cầu'],['fund','Quỹ & chi phí']].forEach(([key,label]) => {
-      const t = el(`<div class="bc-tab ${state.tab===key?'active':''}">${label}</div>`);
+    const tabs = [['sessions','Lịch đánh'],['members','Thành viên'],['courts','Sân cầu'],['fund','Quỹ & chi phí']];
+    if (canManage()) tabs.push(['approve','Duyệt thành viên']);
+    tabs.forEach(([key,label]) => {
+      const pendingCount = key === 'approve' ? state.members.filter(m => m.status === 'pending').length : 0;
+      const badgeHtml = pendingCount > 0 ? ` <span style="background:#993C1D; color:#fff; font-size:11px; padding:1px 6px; border-radius:999px;">${pendingCount}</span>` : '';
+      const t = el(`<div class="bc-tab ${state.tab===key?'active':''}">${label}${badgeHtml}</div>`);
       t.onclick = () => { state.tab = key; render(); refreshAll(); };
       wrap.appendChild(t);
     });
@@ -609,7 +638,9 @@
     row.querySelector(`#avatar-box-${m.id}`).innerHTML = avatarHtml(m, 36);
 
     const actions = row.querySelector(`#row-actions-${m.id}`);
-    if (canManage()) {
+    const protected_ = isProtected(m);
+
+    if (canManage() && !protected_) {
       const statusBtn = el(`<button class="bc-btn outline small">${m.status==='active' ? 'Ngưng hoạt động' : 'Mở lại hoạt động'}</button>`);
       statusBtn.onclick = async () => {
         await mutateMembers(latest => latest.map(x => x.id === m.id ? Object.assign({}, x, { status: x.status === 'active' ? 'inactive' : 'active' }) : x));
@@ -618,49 +649,61 @@
       actions.appendChild(statusBtn);
     }
     if (isAdmin()) {
-      const roleSel = el(`<select class="bc-select" style="width:90px; padding:5px 6px;">
-        <option value="r2" ${m.role==='r2'?'selected':''}>R2</option>
-        <option value="r1" ${m.role==='r1'?'selected':''}>R1</option>
-        <option value="admin" ${m.role==='admin'?'selected':''}>Admin</option>
-      </select>`);
-      roleSel.onchange = async (e) => {
-        const newRole = e.target.value;
-        const ok = await mutateMembers(latest => {
-          const target = latest.find(x => x.id === m.id);
-          if (!target) return null;
-          if (target.role === 'admin' && newRole !== 'admin') {
-            const otherAdmins = latest.filter(x => x.role === 'admin' && x.id !== m.id).length;
-            if (otherAdmins === 0) return null;
-          }
-          return latest.map(x => x.id === m.id ? Object.assign({}, x, { role: newRole }) : x);
-        });
-        if (!ok) alert('Không thể chuyển quyền: cần giữ ít nhất 1 thành viên Admin trong nhóm.');
-        render();
-      };
-      actions.appendChild(roleSel);
-      const resetBtn = el(`<button class="bc-btn outline small">Reset mật khẩu</button>`);
-      resetBtn.onclick = async () => {
-        const newPw = prompt(`Đặt mật khẩu mới cho ${m.name}:`);
-        if (!newPw) return;
-        if (newPw.length < 4) { alert('Mật khẩu cần ít nhất 4 ký tự.'); return; }
-        await mutateMembers(latest => latest.map(x => x.id === m.id ? Object.assign({}, x, { password: newPw }) : x));
-        alert(`Đã đặt lại mật khẩu cho ${m.name}. Hãy báo mật khẩu mới cho họ.`);
-      };
-      actions.appendChild(resetBtn);
-      const delBtn = el(`<button class="bc-btn danger small">Xoá</button>`);
-      delBtn.onclick = async () => {
-        if (!confirm(`Xoá thành viên ${m.name}?`)) return;
-        let blocked = false;
-        const ok = await mutateMembers(latest => {
-          const target = latest.find(x => x.id === m.id);
-          if (target && target.role === 'admin' && latest.filter(x => x.role === 'admin').length === 1) { blocked = true; return null; }
-          return latest.filter(x => x.id !== m.id);
-        });
-        if (blocked) { alert('Không thể xoá: đây là Admin duy nhất của nhóm.'); return; }
-        if (ok && state.me && state.me.id === m.id) { state.myUsername = null; state.me = null; saveMyUsername(); }
-        render();
-      };
-      actions.appendChild(delBtn);
+      if (!protected_) {
+        const roleSel = el(`<select class="bc-select" style="width:90px; padding:5px 6px;">
+          <option value="r2" ${m.role==='r2'?'selected':''}>R2</option>
+          <option value="r1" ${m.role==='r1'?'selected':''}>R1</option>
+          <option value="admin" ${m.role==='admin'?'selected':''}>Admin</option>
+        </select>`);
+        roleSel.onchange = async (e) => {
+          const newRole = e.target.value;
+          const ok = await mutateMembers(latest => {
+            const target = latest.find(x => x.id === m.id);
+            if (!target) return null;
+            if (target.role === 'admin' && newRole !== 'admin') {
+              const otherAdmins = latest.filter(x => x.role === 'admin' && x.id !== m.id).length;
+              if (otherAdmins === 0) return null;
+            }
+            return latest.map(x => x.id === m.id ? Object.assign({}, x, { role: newRole }) : x);
+          });
+          if (!ok) alert('Không thể chuyển quyền: cần giữ ít nhất 1 thành viên Admin trong nhóm.');
+          render();
+        };
+        actions.appendChild(roleSel);
+      } else {
+        actions.appendChild(el(`<span class="bc-badge" style="background:#FAEEDA; color:#854F0B;">🔒 Admin cố định</span>`));
+      }
+
+      // Reset mật khẩu: với kietdmt chỉ cho phép chính họ hoặc admin khác
+      const canReset = !protected_ || canResetProtected();
+      if (canReset) {
+        const resetBtn = el(`<button class="bc-btn outline small">Reset mật khẩu</button>`);
+        resetBtn.onclick = async () => {
+          const newPw = prompt(`Đặt mật khẩu mới cho ${m.name}:`);
+          if (!newPw) return;
+          if (newPw.length < 4) { alert('Mật khẩu cần ít nhất 4 ký tự.'); return; }
+          await mutateMembers(latest => latest.map(x => x.id === m.id ? Object.assign({}, x, { password: newPw }) : x));
+          alert(`Đã đặt lại mật khẩu cho ${m.name}. Hãy báo mật khẩu mới cho họ.`);
+        };
+        actions.appendChild(resetBtn);
+      }
+
+      if (!protected_) {
+        const delBtn = el(`<button class="bc-btn danger small">Xoá</button>`);
+        delBtn.onclick = async () => {
+          if (!confirm(`Xoá thành viên ${m.name}?`)) return;
+          let blocked = false;
+          const ok = await mutateMembers(latest => {
+            const target = latest.find(x => x.id === m.id);
+            if (target && target.role === 'admin' && latest.filter(x => x.role === 'admin').length === 1) { blocked = true; return null; }
+            return latest.filter(x => x.id !== m.id);
+          });
+          if (blocked) { alert('Không thể xoá: đây là Admin duy nhất của nhóm.'); return; }
+          if (ok && state.me && state.me.id === m.id) { state.myUsername = null; state.me = null; saveMyUsername(); }
+          render();
+        };
+        actions.appendChild(delBtn);
+      }
     }
 
     setTimeout(() => {
@@ -1067,6 +1110,54 @@
     setTimeout(() => {
       document.getElementById('fund-month').onchange = (e) => { state.viewMonth = e.target.value || monthKey(); render(); };
     }, 0);
+    return wrap;
+  }
+
+  // ---------- DUYỆT THÀNH VIÊN ----------
+  function renderApprove(){
+    const wrap = el(`<div></div>`);
+    if (!canManage()) {
+      wrap.appendChild(el(`<div class="bc-empty">Chức năng này chỉ dành cho Admin và R1.</div>`));
+      return wrap;
+    }
+    const pending = state.members.filter(m => m.status === 'pending');
+    wrap.appendChild(el(`<h3 style="font-size:15px; color:#1B4332; margin-bottom:12px;">Phê duyệt thành viên mới</h3>`));
+    if (pending.length === 0) {
+      wrap.appendChild(el(`<div class="bc-card" style="text-align:center; padding:2rem; color:#8a877d;">
+        <div style="font-size:2rem; margin-bottom:8px;">✅</div>
+        <div style="font-size:14px;">Không có thành viên nào đang chờ duyệt.</div>
+      </div>`));
+      return wrap;
+    }
+    wrap.appendChild(el(`<div style="font-size:13px; color:#6b7a73; margin-bottom:12px;">Có <strong style="color:#993C1D;">${pending.length}</strong> thành viên đang chờ phê duyệt. Xem xét thông tin và chọn Chấp nhận hoặc Từ chối.</div>`));
+    pending.forEach(m => {
+      const card = el(`<div class="bc-card" style="border-left:3px solid #FAEEDA;">
+        <div style="display:flex; align-items:flex-start; gap:12px; flex-wrap:wrap;">
+          <div style="flex:1; min-width:200px;">
+            <div style="font-weight:500; font-size:15px;">${escapeHtml(m.name)}</div>
+            <div style="font-size:13px; color:#6b7a73; margin-top:2px;">@${escapeHtml(m.username||'')} · ${escapeHtml(m.email)}</div>
+            ${m.phone ? `<div style="font-size:13px; color:#8a877d;">📞 ${escapeHtml(m.phone)}</div>` : ''}
+            <div style="font-size:13px; color:#8a877d; margin-top:4px;">
+              Trình độ: <span class="bc-badge" style="background:#EAF3DE; color:#27500A;">${m.level||'—'}</span>
+            </div>
+          </div>
+          <div style="display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap;">
+            <button class="bc-btn small" id="approve-${m.id}">✓ Chấp nhận</button>
+            <button class="bc-btn danger small" id="reject-${m.id}">✕ Từ chối & Xoá</button>
+          </div>
+        </div>
+      </div>`);
+      card.querySelector(`#approve-${m.id}`).onclick = async () => {
+        await mutateMembers(latest => latest.map(x => x.id === m.id ? Object.assign({}, x, { status: 'active' }) : x));
+        render();
+      };
+      card.querySelector(`#reject-${m.id}`).onclick = async () => {
+        if (!confirm(`Từ chối và xoá tài khoản của ${m.name}?`)) return;
+        await mutateMembers(latest => latest.filter(x => x.id !== m.id));
+        render();
+      };
+      wrap.appendChild(card);
+    });
     return wrap;
   }
 
