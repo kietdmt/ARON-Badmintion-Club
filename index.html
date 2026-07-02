@@ -1684,15 +1684,42 @@
       refreshing = false;
     }
   }
+  let lastActiveTime = Date.now();
+  let isIdle = false;
+  
+  function recordActivity() {
+    lastActiveTime = Date.now();
+    if (isIdle) {
+      isIdle = false;
+      console.log('User active again, resuming refresh...');
+      refreshAll();
+    }
+  }
+  
+  window.addEventListener('mousemove', recordActivity);
+  window.addEventListener('keydown', recordActivity);
+  window.addEventListener('click', recordActivity);
+  window.addEventListener('scroll', recordActivity);
+
   let autoRefreshTimer = null;
   function startAutoRefresh(){
     if (autoRefreshTimer) return;
     
-    const refreshIfVisible = () => {
-      if (!document.hidden) refreshAll();
+    const refreshIfActive = () => {
+      if (document.hidden) return;
+      
+      // Nếu người dùng không hoạt động > 3 phút (180000 ms), tạm dừng polling
+      if (Date.now() - lastActiveTime > 180000) {
+        if (!isIdle) {
+          isIdle = true;
+          console.log('User is idle. Polling paused.');
+        }
+        return;
+      }
+      refreshAll();
     };
     
-    autoRefreshTimer = setInterval(refreshIfVisible, 10000);
+    autoRefreshTimer = setInterval(refreshIfActive, 15000); // 15 giây kiểm tra 1 lần để giảm tải kết nối
     
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
@@ -1701,13 +1728,15 @@
           autoRefreshTimer = null;
         }
       } else {
-        refreshAll();
+        recordActivity();
         if (!autoRefreshTimer) {
-          autoRefreshTimer = setInterval(refreshIfVisible, 10000);
+          autoRefreshTimer = setInterval(refreshIfActive, 15000);
         }
       }
     });
-    window.addEventListener('focus', () => refreshAll());
+    window.addEventListener('focus', () => {
+      recordActivity();
+    });
   }
 
   loadAll().then(() => {
